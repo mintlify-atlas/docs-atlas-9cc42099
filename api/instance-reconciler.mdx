@@ -1,0 +1,293 @@
+---
+title: Instance Reconciler Behavior
+description: In-pod watch loop for RedisCluster configuration
+---
+
+## Overview
+
+Each Redis data pod runs an **instance reconciler** that watches the `RedisCluster` CR from inside the pod. This enables live configuration updates without pod restarts.
+
+**Controller Name:** `instance-reconciler`
+
+**Reconciliation Trigger:** Any change to the `RedisCluster` resource
+
+## Reconciliation Steps
+
+The reconciler executes these steps in order on every reconciliation:
+
+### 1. Fencing Check
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:96-102`
+
+**Behavior:**
+- Reads `redis.io/fencedInstances` annotation
+- Parses JSON array of fenced pod names
+- If current pod is in the list:
+  - Logs: `Pod is fenced, stopping redis-server`
+  - Sends `SIGINT` to redis-server process
+  - Skips all remaining steps
+  - Returns immediately
+
+**Purpose:** Implements operator-controlled fencing for split-brain prevention.
+
+---
+
+### 2. Role Reconciliation
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:104-108`
+
+**Behavior:**
+
+The reconciler ensures the instance has the correct replication role based on `status.currentPrimary` and `spec.replicaMode`.
+
+#### Replica Mode Enabled
+
+If `spec.replicaMode.enabled=true`:
+
+1. Extract external source from `spec.replicaMode.source.host` and `spec.replicaMode.source.port` (default: 6379)
+2. If `spec.replicaMode.promote=true` and `status.currentPrimary == POD_NAME`:
+   - Issue `REPLICAOF NO ONE` to promote out of replica mode
+   - Record event: `ReplicaModePromoteRequested`
+3. Otherwise:
+   - Issue `REPLICAOF <source.host> <source.port>` if not already replicating from that source
+   - Record event: `ReplicaModeSourceUpdated`
+
+#### Standard Mode
+
+If `spec.replicaMode.enabled=false` or not set:
+
+1. Determine expected role:
+   - `isPrimary = (status.currentPrimary == POD_NAME)`
+2. Query Redis `INFO replication` for actual role
+3. Compare expected vs actual:
+
+**Case: Should be primary but is replica**
+- Issue `REPLICAOF NO ONE`
+- Record event: `PromotedToPrimary`
+
+**Case: Should be replica but is primary**
+- Resolve primary pod IP via Kubernetes API
+- Issue `REPLICAOF <primary-ip> 6379`
+- Record event: `DemotedToReplica`
+
+**Case: Is replica but wrong upstream**
+- Query current master host/port from `INFO replication`
+- If not matching expected primary IP:
+  - Resolve primary pod IP
+  - Issue `REPLICAOF <primary-ip> 6379`
+  - Record event: `ReplicaReconfigured`
+
+---
+
+### 3. Config Reconciliation
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:110-116`
+
+**Behavior:**
+- Iterate over `spec.redis` map
+- Skip parameters requiring restart: `bind`, `port`, `tls-port`, `unixsocket`, `databases`
+- For each live-reloadable parameter:
+  - Issue `CONFIG SET <key> <value>`
+- Record event: `ConfigReloaded` (only if `spec.redis` is non-empty)
+
+**Restart-Required Parameters:**
+
+These are applied at pod startup but not live-reloaded:
+- `bind`
+- `port`
+- `tls-port`
+- `unixsocket`
+- `databases`
+
+**Live-Reloadable Examples:**
+- `maxmemory`
+- `maxmemory-policy`
+- `tcp-keepalive`
+- `timeout`
+- `save`
+
+---
+
+### 4. Secret Reconciliation
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:118-122`
+
+**Behavior:**
+
+Reads secrets from projected volume mounts at `/projected/<secret-name>/<key>` and applies changes via Redis commands.
+
+#### Auth Secret (`spec.authSecret`)
+
+1. Read password from `/projected/<authSecret.name>/password`
+2. Issue `CONFIG SET requirepass <password>`
+3. Issue `CONFIG SET masterauth <password>`
+4. Store password for replica mode auth override (see below)
+
+#### ACL Config Secret (`spec.aclConfigSecret`)
+
+1. Read ACL rules from `/projected/<aclConfigSecret.name>/acl`
+2. Write to `/data/users.acl` (path configurable via `REDIS_OPERATOR_ACL_FILE_PATH`)
+3. Issue `ACL LOAD` command
+
+#### Replica Mode Auth Override
+
+If `spec.replicaMode.enabled=true` and `spec.replicaMode.source.authSecretName` is set:
+1. Read upstream password from `/projected/<authSecretName>/password`
+2. Issue `CONFIG SET masterauth <upstream-password>`
+3. This overrides the local auth password for upstream replication
+
+Otherwise, if not in replica mode:
+- Clear stale upstream auth: `CONFIG SET masterauth ""`
+
+---
+
+### 5. TLS Certificate Rotation
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:124-128`
+
+**Behavior:**
+
+Detects TLS certificate changes and reloads them without restarting redis-server.
+
+**Detection:**
+1. Read certificate files:
+   - `/tls/tls.crt`
+   - `/tls/tls.key`
+   - `/tls/ca.crt`
+2. Compute SHA256 checksum for each file
+3. Compare to cached checksums from previous reconciliation
+4. If any checksum changed:
+   - Issue `CONFIG SET tls-cert-file /tls/tls.crt`
+   - Issue `CONFIG SET tls-key-file /tls/tls.key`
+   - Issue `CONFIG SET tls-ca-cert-file /tls/ca.crt`
+   - Record event: `CertificatesRotated`
+   - Update cached checksums
+
+**Initialization:**
+- On first reconciliation, cache checksums without issuing CONFIG SET
+- Certificates are initially loaded at redis-server startup
+
+---
+
+### 6. Status Reporting
+
+**Source:** `internal/instance-manager/reconciler/reconciler.go:130-134`
+
+**Behavior:**
+
+1. Query Redis `INFO replication`
+2. Build `InstanceStatus` object:
+   - `role`: `master` or `slave`
+   - `connected`: `true`
+   - `replicationOffset`: `master_repl_offset` (primary) or `slave_repl_offset` (replica)
+   - `connectedReplicas`: Number of connected replicas (primary only)
+   - `masterLinkStatus`: `up` or `down` (replica only)
+3. Patch `status.instancesStatus[POD_NAME]` using client-side merge patch
+
+**Patch Strategy:**
+```go
+patch := client.MergeFrom(cluster.DeepCopy())
+if cluster.Status.InstancesStatus == nil {
+    cluster.Status.InstancesStatus = make(map[string]redisv1.InstanceStatus)
+}
+cluster.Status.InstancesStatus[r.podName] = status
+return r.client.Status().Patch(ctx, cluster, patch)
+```
+
+---
+
+## Environment Variables
+
+<ParamField path="REDIS_OPERATOR_PROJECTED_SECRETS_DIR" type="string" default="/projected">
+  Base directory for projected secret volumes
+</ParamField>
+
+<ParamField path="REDIS_OPERATOR_ACL_FILE_PATH" type="string" default="/data/users.acl">
+  Path to write ACL configuration file
+</ParamField>
+
+---
+
+## File Paths
+
+| File | Purpose |
+|------|----------|
+| `/projected/<secret-name>/<key>` | Projected secret mounts |
+| `/data/users.acl` | ACL configuration file |
+| `/tls/tls.crt` | TLS certificate |
+| `/tls/tls.key` | TLS private key |
+| `/tls/ca.crt` | TLS CA certificate |
+| `/data/dump.rdb` | RDB backup file |
+| `/data/appendonlydir/` | AOF directory |
+
+---
+
+## Reconciliation Frequency
+
+The instance reconciler is triggered by:
+1. **Watch events** - Any change to the `RedisCluster` resource
+2. **Requeue** - Not used (no periodic requeue)
+
+**Note:** Status reporting happens on every reconciliation, not on a timer.
+
+---
+
+## Error Handling
+
+**Fatal errors (stop reconciliation):**
+- Cannot fetch `RedisCluster` CR
+- Role reconciliation fails
+- Status reporting fails
+
+**Non-fatal errors (log and continue):**
+- Config reconciliation fails
+- Secret reconciliation fails
+- TLS certificate rotation fails
+
+Non-fatal errors are logged but do not prevent status reporting.
+
+---
+
+## Events
+
+The reconciler emits these Kubernetes events on the `RedisCluster` resource:
+
+| Event Type | Reason | Trigger |
+|------------|--------|----------|
+| Warning | `InstanceFenced` | Pod is fenced |
+| Normal | `PromotedToPrimary` | Replica promoted to primary |
+| Normal | `DemotedToReplica` | Primary demoted to replica |
+| Normal | `ReplicaReconfigured` | Replica upstream changed |
+| Normal | `ReplicaModePromoteRequested` | Promotion out of replica mode |
+| Normal | `ReplicaModeSourceUpdated` | External source configured |
+| Normal | `ConfigReloaded` | Redis config parameters reloaded |
+| Normal | `CertificatesRotated` | TLS certificates reloaded |
+
+---
+
+## Credentials Resolution
+
+Secrets are **always** read from projected volumes, never from the Kubernetes API. This reduces API load and avoids RBAC requirements for Secrets in the instance manager.
+
+**Projected Volume Mount:**
+```yaml
+volumes:
+  - name: projected-secrets
+    projected:
+      sources:
+        - secret:
+            name: redis-auth
+            items:
+              - key: password
+                path: redis-auth/password
+        - secret:
+            name: acl-config
+            items:
+              - key: acl
+                path: acl-config/acl
+```
+
+**Read Path:**
+```go
+data, err := os.ReadFile("/projected/redis-auth/password")
+```

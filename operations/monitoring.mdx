@@ -1,0 +1,286 @@
+---
+title: Monitoring and Observability
+description: Metrics, dashboards, and alerting for Redis Operator
+---
+
+The Redis Operator ships with comprehensive monitoring assets for Prometheus and Grafana, providing observability by default.
+
+## What is Exposed
+
+Metrics are exposed from two places:
+
+### Operator Controller (`:9090/metrics`)
+
+The operator controller exposes metrics about cluster management:
+
+- `redis_cluster_phase` - Current phase of each Redis cluster
+- `redis_cluster_instances_total` - Total number of instances per cluster
+- `redis_failover_total` - Count of failover operations
+- `redis_reconcile_duration_seconds` - Reconciliation loop duration
+- `redis_last_successful_backup_timestamp` - Timestamp of last successful backup
+- `redis_backup_phase_count` - Count of backups by phase
+
+### Redis Instance Manager (`:8080/metrics`)
+
+Each data pod runs an instance manager that exposes Redis-level metrics:
+
+**Availability and role:**
+- `redis_up` - Redis instance health (1 = up, 0 = down)
+- `redis_instance_info` - Instance metadata (role, version, etc.)
+
+**Replication:**
+- `redis_replication_lag_bytes` - Replication lag in bytes
+- `redis_connected_replicas` - Number of connected replicas
+- `redis_master_link_up` - Master link status for replicas
+
+**Memory:**
+- `redis_used_memory_bytes` - Current memory usage
+- `redis_maxmemory_bytes` - Maximum memory limit
+- `redis_mem_fragmentation_ratio` - Memory fragmentation ratio
+- `redis_evicted_keys_total` - Total number of evicted keys
+
+**Connections:**
+- `redis_connected_clients` - Number of connected clients
+- `redis_blocked_clients` - Number of blocked clients
+- `redis_rejected_connections_total` - Total rejected connections
+
+**Operations:**
+- `redis_instantaneous_ops_per_sec` - Current operations per second
+- `redis_command_calls_total` - Total command calls by command type
+- `redis_keyspace_hits_total` - Total keyspace hits
+- `redis_keyspace_misses_total` - Total keyspace misses
+
+**Persistence:**
+- `redis_rdb_last_save_timestamp` - Last RDB save timestamp
+- `redis_rdb_last_bgsave_duration_seconds` - Last BGSAVE duration
+- `redis_aof_last_rewrite_duration_seconds` - Last AOF rewrite duration
+
+## Helm Setup
+
+Enable monitoring components in your Helm values:
+
+```yaml values.yaml
+metrics:
+  serviceMonitor:
+    enabled: true
+
+monitoring:
+  podMonitor:
+    enabled: true
+  alertingRules:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+```
+
+This installs the following resources:
+
+- `ServiceMonitor` for operator metrics scraping
+- `PodMonitor` for instance-manager metrics scraping
+- `PrometheusRule` with default Redis alerts
+- `ConfigMap` with Grafana dashboard (auto-discovered via `grafana_dashboard: "1"` label)
+
+<Note>
+Requires Prometheus Operator to be installed in your cluster.
+</Note>
+
+## Grafana Dashboard
+
+The bundled dashboard is located at `charts/redis-operator/dashboards/redis-overview.json` and includes:
+
+- **Cluster overview** - Phase, desired/healthy/unhealthy instances
+- **Replication health** - Lag, connected replicas, master link status
+- **Memory and connections** - Usage, fragmentation, client connections
+- **Command throughput** - Operations per second, hit ratio
+- **Persistence** - RDB/AOF backup visibility
+
+### Installation Options
+
+<Steps>
+  <Step title="Automatic (Recommended)">
+    Keep `monitoring.grafanaDashboard.enabled=true` in Helm values. Grafana's sidecar will automatically discover and import the dashboard.
+  </Step>
+  
+  <Step title="Manual Import">
+    Import the JSON file directly from `charts/redis-operator/dashboards/redis-overview.json` via the Grafana UI.
+  </Step>
+</Steps>
+
+## Alerting Rules
+
+The operator creates the following default alerts:
+
+### RedisPrimaryUnavailable
+
+Fires when no primary instance is available for a cluster.
+
+**Severity:** Critical
+
+### RedisReplicationLagHigh
+
+Fires when replication lag exceeds the configured threshold.
+
+**Severity:** Warning  
+**Default threshold:** 10 MB
+
+### RedisMemoryUsageHigh
+
+Fires when memory usage exceeds the configured ratio.
+
+**Severity:** Warning  
+**Default threshold:** 85%
+
+### RedisBackupMissing
+
+Fires when no successful backup has completed within the configured window.
+
+**Severity:** Warning  
+**Default threshold:** 24 hours
+
+### RedisInstanceDown
+
+Fires when a Redis instance is down.
+
+**Severity:** Critical
+
+## Tuning Alert Thresholds
+
+### Global Thresholds
+
+Configure global alert thresholds in Helm values:
+
+```yaml values.yaml
+monitoring:
+  alertingRules:
+    replicationLagThresholdBytes: 10485760  # 10 MB
+    memoryUsageThresholdRatio: 0.85         # 85%
+    backupMissingSeconds: 86400             # 24 hours
+```
+
+### Per-Cluster Customization
+
+Create additional `PrometheusRule` resources for cluster-specific thresholds:
+
+```yaml custom-alerts.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-operator-alerts-team-a
+  namespace: monitoring
+spec:
+  groups:
+    - name: redis-team-a
+      rules:
+        - alert: RedisReplicationLagHigh
+          expr: |
+            max by (namespace, cluster, pod) (
+              redis_replication_lag_bytes{
+                namespace="payments",
+                cluster="orders",
+                role="slave"
+              }
+            ) > 5242880
+          for: 2m
+          labels:
+            severity: warning
+            team: team-a
+          annotations:
+            summary: "High replication lag for {{ $labels.cluster }}"
+            description: "Replication lag is {{ $value }} bytes"
+```
+
+<Note>
+Keep the default `PrometheusRule` enabled for baseline coverage, then layer on additional rules for specific clusters.
+</Note>
+
+## Custom Query Packs
+
+For organization-specific monitoring needs, version custom PromQL queries in ConfigMaps:
+
+```yaml custom-queries.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-custom-queries
+  namespace: monitoring
+data:
+  rules.yaml: |
+    groups:
+      - name: redis-custom
+        rules:
+          - record: redis:read_write_ratio
+            expr: |
+              sum(rate(redis_command_calls_total{command="get"}[5m]))
+              /
+              clamp_min(sum(rate(redis_command_calls_total{command=~"set|del"}[5m])), 1)
+          - record: redis:hit_ratio
+            expr: |
+              sum(rate(redis_keyspace_hits_total[5m]))
+              /
+              (
+                sum(rate(redis_keyspace_hits_total[5m]))
+                +
+                sum(rate(redis_keyspace_misses_total[5m]))
+              )
+```
+
+Deploy these via your Prometheus/stack workflow (e.g., GitOps pipeline).
+
+## Validation
+
+<Steps>
+  <Step title="Verify monitoring CRDs">
+    Render the Helm chart and confirm all monitoring resources are present:
+    
+    ```bash
+    helm template redis-operator charts/redis-operator \
+      --set monitoring.podMonitor.enabled=true \
+      --set monitoring.alertingRules.enabled=true \
+      --set monitoring.grafanaDashboard.enabled=true \
+      | grep -E "kind: (ServiceMonitor|PodMonitor|PrometheusRule|ConfigMap)"
+    ```
+  </Step>
+  
+  <Step title="Check alert syntax">
+    Validate PrometheusRule syntax:
+    
+    ```bash
+    kubectl get prometheusrule redis-operator-alerts -o yaml | \
+      promtool check rules /dev/stdin
+    ```
+  </Step>
+  
+  <Step title="Validate dashboard JSON">
+    Ensure dashboard JSON is valid:
+    
+    ```bash
+    jq empty charts/redis-operator/dashboards/redis-overview.json
+    ```
+  </Step>
+  
+  <Step title="Verify metrics endpoints">
+    Test metrics endpoints directly:
+    
+    ```bash
+    # Operator metrics
+    kubectl port-forward -n redis-system deploy/redis-operator 9090:9090
+    curl http://localhost:9090/metrics | grep redis_
+    
+    # Instance manager metrics
+    kubectl port-forward -n default pod/my-cluster-0 8080:8080
+    curl http://localhost:8080/metrics | grep redis_
+    ```
+  </Step>
+</Steps>
+
+## Performance Impact
+
+Metrics collection has minimal overhead:
+
+- Controller metrics: ~1 MB memory, negligible CPU
+- Instance manager metrics: ~2-5 MB memory per pod, {'<'}1% CPU
+- Scrape interval: Default 30s (configurable in ServiceMonitor/PodMonitor)
+
+<Warning>
+For clusters with 50+ managed Redis instances, consider increasing operator memory limits to 512Mi-1Gi to handle metrics buffering during scrape cycles.
+</Warning>

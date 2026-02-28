@@ -1,0 +1,526 @@
+---
+title: Performance Tuning
+description: Optimize Redis Operator and Redis cluster performance
+---
+
+This guide covers performance tuning for both the Redis Operator controller and managed Redis clusters.
+
+## Operator Performance
+
+### Supported Scale
+
+The operator has been benchmarked to support:
+
+**Up to 100 clusters per operator instance** (3 pods/cluster = 300 total pods)
+
+#### Benchmark Results
+
+Based on benchmarks at `internal/controller/cluster/reconciler_test.go`:
+
+| Clusters | Reconcile Latency | Throughput | API Calls/sec | Memory Usage |
+|----------|-------------------|------------|---------------|---------------|
+| 10 | 55.40 ms | 180.5 reconciles/s | 5,055 | 17.96 MB/op |
+| 50 | 751.13 ms | 66.57 reconciles/s | 1,864 | 360.89 MB/op |
+| 100 | 2,659.08 ms | 37.61 reconciles/s | 1,053 | 1.36 GB/op |
+
+<Note>
+Benchmark environment: Linux amd64 VM (4 vCPUs, 15 GiB RAM, AMD EPYC 7B13) running Go 1.25.1 on kind v0.29.0.
+</Note>
+
+### Recommended Operator Resources
+
+Set operator resource requests/limits based on managed cluster count:
+
+| Managed Clusters | CPU Request | CPU Limit | Memory Request | Memory Limit |
+|-----------------|-------------|-----------|----------------|---------------|
+| Up to 10 | 100m | 500m | 128Mi | 256Mi |
+| Up to 50 | 250m | 1000m | 512Mi | 1Gi |
+| Up to 100 | 500m | 2000m | 1Gi | 2Gi |
+
+Configure in Helm values:
+
+```yaml values.yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+```
+
+<Note>
+Chart defaults (`100m/128Mi` request, `500m/256Mi` limit) are appropriate for small deployments with up to 10 clusters.
+</Note>
+
+### Concurrency Tuning
+
+The operator uses a work queue with configurable concurrency:
+
+```yaml values.yaml
+extraArgs:
+  - --max-concurrent-reconciles=5  # Default: 5
+```
+
+**Tuning guidance:**
+
+- **5 (default)** - Good for most deployments up to 50 clusters
+- **10-15** - For 50-100 clusters with fast Kubernetes API server
+- **20+** - Only for dedicated operator instances with powerful nodes
+
+<Warning>
+Increasing concurrency beyond 15 may cause excessive API server load and GC pressure. Monitor CPU and memory usage when tuning.
+</Warning>
+
+### Performance Profiling
+
+Enable pprof for profiling:
+
+```yaml values.yaml
+extraArgs:
+  - --pprof-bind-address=:6060
+```
+
+Access profiling endpoints:
+
+```bash
+kubectl port-forward -n redis-system deploy/redis-operator 6060:6060
+
+# CPU profile
+curl http://localhost:6060/debug/pprof/profile?seconds=30 > cpu.prof
+go tool pprof cpu.prof
+
+# Memory profile
+curl http://localhost:6060/debug/pprof/heap > mem.prof
+go tool pprof mem.prof
+
+# Goroutine profile
+curl http://localhost:6060/debug/pprof/goroutine > goroutine.prof
+go tool pprof goroutine.prof
+```
+
+### Leader Election
+
+The operator uses leader election for high availability:
+
+```yaml values.yaml
+extraArgs:
+  - --leader-elect=true  # Default: true
+  - --leader-elect-lease-duration=15s
+  - --leader-elect-renew-deadline=10s
+  - --leader-elect-retry-period=2s
+```
+
+**Production recommendations:**
+
+- Keep `leader-elect=true` for HA deployments
+- Use default timing values unless latency is critical
+- Run 2-3 operator replicas for redundancy
+
+### Monitoring Operator Performance
+
+Watch reconciliation metrics:
+
+```promql
+# Reconciliation duration (p95)
+histogram_quantile(0.95, rate(redis_reconcile_duration_seconds_bucket[5m]))
+
+# Reconciliation rate
+rate(redis_reconcile_duration_seconds_count[5m])
+
+# Work queue depth
+workqueue_depth{name="rediscluster"}
+
+# Work queue latency
+workqueue_queue_duration_seconds{name="rediscluster"}
+```
+
+## Redis Instance Performance
+
+### CPU and Memory
+
+Size Redis pods based on your workload:
+
+```yaml
+spec:
+  resources:
+    requests:
+      cpu: 1000m      # 1 CPU core
+      memory: 2Gi     # 2 GB RAM
+    limits:
+      cpu: 2000m      # 2 CPU cores  
+      memory: 4Gi     # 4 GB RAM
+```
+
+**Sizing guidelines:**
+
+| Workload | CPU | Memory | Notes |
+|----------|-----|---------|-------|
+| Development | 100m | 256Mi | Minimal, not for load testing |
+| Light production | 500m | 1Gi | {'<'}10k ops/sec, {'<'}1M keys |
+| Medium production | 1000m | 2-4Gi | {'<'}50k ops/sec, {'<'}10M keys |
+| Heavy production | 2000m+ | 8-16Gi | >50k ops/sec, >10M keys |
+
+<Note>
+Redis is single-threaded for command processing. CPU limits above 2000m (2 cores) only benefit background tasks (BGSAVE, replication, etc.).
+</Note>
+
+### Memory Management
+
+Configure Redis `maxmemory` and eviction policy:
+
+```yaml
+spec:
+  redis:
+    maxmemory: "1gb"
+    maxmemory-policy: "allkeys-lru"
+```
+
+**Eviction policies:**
+
+- `noeviction` - Return errors when memory limit is reached (default for persistence)
+- `allkeys-lru` - Evict least recently used keys (recommended for caching)
+- `volatile-lru` - Evict least recently used keys with TTL set
+- `allkeys-lfu` - Evict least frequently used keys (Redis 4.0+)
+- `volatile-ttl` - Evict keys with shortest TTL
+
+<Warning>
+**Set `maxmemory` to 75-80% of container memory limit** to leave room for replication buffers, COW during BGSAVE, and overhead.
+</Warning>
+
+**Example:**
+
+For a pod with `memory: 4Gi` limit:
+
+```yaml
+spec:
+  resources:
+    limits:
+      memory: 4Gi
+  redis:
+    maxmemory: "3gb"  # 75% of 4Gi
+    maxmemory-policy: "allkeys-lru"
+```
+
+### Persistence Tuning
+
+#### RDB Snapshots
+
+Configure snapshot frequency:
+
+```yaml
+spec:
+  redis:
+    save: "900 1 300 10 60 10000"  # Default
+    # Format: "<seconds> <changes> <seconds> <changes> ..."
+    # Save if: 1 key changed in 900s, OR 10 keys in 300s, OR 10k keys in 60s
+```
+
+**Performance impact:**
+
+- **Low frequency** (`save: "3600 1"`) - Less disk I/O, more data loss risk
+- **High frequency** (`save: "60 1"`) - More disk I/O, less data loss risk
+- **Disabled** (`save: ""`) - No snapshots, fastest (not recommended for production)
+
+<Note>
+RDB snapshots use COW (copy-on-write). During BGSAVE, memory usage can temporarily double if dataset has high write rate.
+</Note>
+
+#### AOF (Append-Only File)
+
+Enable AOF for better durability:
+
+```yaml
+spec:
+  redis:
+    appendonly: "yes"
+    appendfsync: "everysec"  # Options: always, everysec, no
+```
+
+**fsync modes:**
+
+- `always` - Fsync after every write (safest, slowest)
+- `everysec` - Fsync once per second (default, good balance)
+- `no` - Never fsync, let OS decide (fastest, least safe)
+
+<Warning>
+AOF can cause write performance degradation. Use `appendfsync: everysec` for a balance between durability and performance.
+</Warning>
+
+### Storage Performance
+
+Use fast storage for Redis data volumes:
+
+| Storage Type | IOPS | Throughput | Latency | Use Case |
+|--------------|------|------------|---------|----------|
+| AWS EBS gp3 | 16k+ | 1000 MB/s | {'<'}1ms | Recommended |
+| AWS EBS io2 | 64k+ | 4000 MB/s | {'<'}0.25ms | Mission-critical |
+| GCP PD SSD | 30k+ | 1200 MB/s | {'<'}1ms | Recommended |
+| Azure Premium SSD | 20k+ | 900 MB/s | {'<'}1ms | Recommended |
+| Local NVMe | 100k+ | 3000+ MB/s | {'<'}0.1ms | Best performance |
+
+Configure storage class:
+
+```yaml
+spec:
+  storage:
+    size: 100Gi
+    storageClassName: fast-ssd  # Use SSD-backed storage
+```
+
+<Note>
+Local NVMe offers the best performance but lacks data durability across node failures. Use with frequent backups.
+</Note>
+
+### Network Performance
+
+Redis is network-intensive for replication and client connections.
+
+#### Replication Optimization
+
+Configure replication buffer sizes:
+
+```yaml
+spec:
+  redis:
+    repl-backlog-size: "256mb"  # Default: 1mb (too small!)
+    client-output-buffer-limit: "replica 512mb 128mb 60"
+```
+
+**Buffer sizing:**
+
+- `repl-backlog-size` should cover 5-10 minutes of writes during peak traffic
+- Calculate: `(avg_write_rate_MB/s) * 600 seconds`
+- Example: 1 MB/s write rate → 600 MB backlog
+
+<Warning>
+Insufficient replication backlog causes full resyncs, which are expensive (RDB generation + network transfer).
+</Warning>
+
+#### Connection Limits
+
+```yaml
+spec:
+  redis:
+    maxclients: "10000"  # Default: 10000
+```
+
+Increase for high-concurrency workloads with many concurrent connections.
+
+### Synchronous Replication
+
+Reduce data loss risk with synchronous replication:
+
+```yaml
+spec:
+  minSyncReplicas: 1  # Require at least 1 replica to ACK writes
+  maxSyncReplicas: 2  # Use up to 2 replicas for sync replication
+```
+
+**Trade-offs:**
+
+- **Higher `minSyncReplicas`** - Better durability, higher write latency
+- **Lower `minSyncReplicas`** - Lower write latency, more data loss risk on failover
+
+<Note>
+Setting `minSyncReplicas: N` means writes block until N replicas acknowledge. This increases write latency by 1-5ms per replica.
+</Note>
+
+## Redis Configuration Best Practices
+
+### Recommended Production Config
+
+```yaml cluster.yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: production-cluster
+spec:
+  instances: 3
+  imageName: redis:7.2
+  
+  storage:
+    size: 100Gi
+    storageClassName: fast-ssd
+  
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 4Gi
+    limits:
+      cpu: 2000m
+      memory: 8Gi
+  
+  redis:
+    # Memory
+    maxmemory: "6gb"  # 75% of 8Gi limit
+    maxmemory-policy: "allkeys-lru"
+    
+    # Persistence
+    save: "900 1 300 10 60 10000"
+    appendonly: "yes"
+    appendfsync: "everysec"
+    
+    # Replication
+    repl-backlog-size: "512mb"
+    repl-diskless-sync: "yes"
+    repl-diskless-sync-delay: "5"
+    
+    # Networking
+    tcp-backlog: "511"
+    tcp-keepalive: "300"
+    timeout: "0"
+    
+    # Performance
+    lazyfree-lazy-eviction: "yes"
+    lazyfree-lazy-expire: "yes"
+    lazyfree-lazy-server-del: "yes"
+    replica-lazy-flush: "yes"
+  
+  minSyncReplicas: 1
+  maxSyncReplicas: 1
+  
+  enablePodDisruptionBudget: true
+```
+
+### Lazy Freeing
+
+Enable lazy freeing to avoid blocking on expensive DEL operations:
+
+```yaml
+spec:
+  redis:
+    lazyfree-lazy-eviction: "yes"    # Async eviction
+    lazyfree-lazy-expire: "yes"      # Async key expiration
+    lazyfree-lazy-server-del: "yes" # Async DEL commands
+    replica-lazy-flush: "yes"        # Async FLUSHALL on replicas
+```
+
+This moves expensive memory deallocation to background threads (Redis 4.0+).
+
+### Diskless Replication
+
+Use diskless replication for faster replica syncs:
+
+```yaml
+spec:
+  redis:
+    repl-diskless-sync: "yes"
+    repl-diskless-sync-delay: "5"  # Wait 5s for more replicas before starting sync
+```
+
+**Benefits:**
+
+- Skips intermediate RDB file write to disk
+- Streams snapshot directly to replicas over network
+- Faster sync, lower disk I/O
+
+**Drawbacks:**
+
+- Cannot reuse snapshot for multiple replicas simultaneously
+- Delay before sync starts (waiting for replicas)
+
+<Note>
+Diskless replication is recommended when network is faster than disk or when managing many replicas.
+</Note>
+
+## Performance Monitoring
+
+### Key Metrics to Watch
+
+**Throughput:**
+```promql
+rate(redis_command_calls_total[5m])
+```
+
+**Latency (from INFO stats):**
+```promql
+redis_instantaneous_ops_per_sec
+```
+
+**Memory usage:**
+```promql
+redis_used_memory_bytes / redis_maxmemory_bytes
+```
+
+**Hit rate:**
+```promql
+rate(redis_keyspace_hits_total[5m]) / 
+  (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m]))
+```
+
+**Replication lag:**
+```promql
+redis_replication_lag_bytes{role="slave"}
+```
+
+**Evicted keys:**
+```promql
+rate(redis_evicted_keys_total[5m])
+```
+
+### Grafana Dashboard
+
+The bundled Grafana dashboard at `charts/redis-operator/dashboards/redis-overview.json` includes performance panels. Import it for instant visibility.
+
+## Troubleshooting Performance Issues
+
+### High CPU Usage
+
+**Possible causes:**
+
+- Too many connections - Check `redis_connected_clients`
+- Slow commands - Use `SLOWLOG GET` to identify
+- Background tasks - Check `redis_rdb_last_bgsave_duration_seconds`
+
+**Solutions:**
+
+- Increase CPU limit
+- Optimize application queries
+- Use pipelining to batch commands
+- Add read replicas to distribute load
+
+### High Memory Usage
+
+**Possible causes:**
+
+- Dataset too large - Check `redis_used_memory_bytes`
+- Memory fragmentation - Check `redis_mem_fragmentation_ratio`
+- Replication buffers - Check `redis_replication_lag_bytes`
+
+**Solutions:**
+
+- Increase `maxmemory` and container limits
+- Enable eviction policy
+- Restart Redis to defragment (requires failover)
+- Increase `repl-backlog-size`
+
+### Slow Replication
+
+**Possible causes:**
+
+- Insufficient network bandwidth
+- Small replication backlog (causing full resyncs)
+- High write rate on primary
+
+**Solutions:**
+
+- Increase `repl-backlog-size`
+- Use faster network (10 Gbps+)
+- Enable diskless replication
+- Reduce write rate or batch writes
+
+### Disk I/O Saturation
+
+**Possible causes:**
+
+- Frequent BGSAVE operations
+- AOF rewrite operations
+- Slow storage backend
+
+**Solutions:**
+
+- Reduce RDB snapshot frequency
+- Disable AOF or use `appendfsync: everysec`
+- Upgrade to faster storage (SSD/NVMe)
+- Use diskless replication

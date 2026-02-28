@@ -1,0 +1,381 @@
+---
+title: Storage Configuration
+description: PVC management, volume expansion, and lifecycle states
+---
+
+Redis Operator manages PersistentVolumeClaims (PVCs) for Redis data directories. Each pod gets a dedicated PVC mounted at `/data`.
+
+## StorageSpec
+
+The `storage` field in `RedisClusterSpec` defines the PVC template.
+
+<ParamField path="size" type="Quantity" required default="1Gi">
+  Requested storage size per pod.
+  
+  **Example values**: `1Gi`, `10Gi`, `100Gi`, `1Ti`
+  
+  ```yaml
+  spec:
+    storage:
+      size: 50Gi
+  ```
+</ParamField>
+
+<ParamField path="storageClassName" type="*string">
+  Name of the StorageClass to use. If omitted, uses the cluster default.
+  
+  ```yaml
+  spec:
+    storage:
+      size: 50Gi
+      storageClassName: fast-ssd
+  ```
+</ParamField>
+
+## PVC Naming Convention
+
+PVCs follow the pattern: `<cluster-name>-data-<ordinal>`
+
+**Example**:
+```bash
+$ kubectl get pvc -l redis.io/cluster=my-cluster
+NAME              STATUS   VOLUME                                     CAPACITY
+my-cluster-data-0   Bound    pvc-a1b2c3d4-e5f6-7890-abcd-ef1234567890   10Gi
+my-cluster-data-1   Bound    pvc-b2c3d4e5-f6a7-8901-bcde-f12345678901   10Gi
+my-cluster-data-2   Bound    pvc-c3d4e5f6-a7b8-9012-cdef-123456789012   10Gi
+```
+
+## PVC Lifecycle States
+
+The operator tracks PVC health in `status.healthyPVC` and `status.danglingPVC`.
+
+### Healthy PVCs
+
+PVCs that:
+1. Exist and are `Bound`
+2. Match the desired storage size (or expansion in progress)
+3. Correspond to an active pod (ordinal < `spec.instances`)
+
+**Status field**: `status.healthyPVC`
+
+```yaml
+status:
+  healthyPVC: 3
+```
+
+### Dangling PVCs
+
+PVCs that exist but have no corresponding pod. This happens when:
+- Cluster was scaled down (instances reduced)
+- Pod was deleted but PVC persists
+
+**Status field**: `status.danglingPVC`
+
+```yaml
+status:
+  danglingPVC:
+    - my-cluster-data-3
+    - my-cluster-data-4
+```
+
+**Dangling PVCs are never automatically deleted.** This prevents accidental data loss. To clean up:
+
+```bash
+# Review contents first
+kubectl delete pvc my-cluster-data-3
+```
+
+### Resizing PVCs
+
+When `spec.storage.size` is increased, the operator:
+1. Checks if the StorageClass supports `allowVolumeExpansion`
+2. Patches each PVC's `spec.resources.requests.storage`
+3. Waits for the filesystem resize to complete
+
+**Lifecycle**:
+```mermaid
+graph LR
+    A[Increase spec.storage.size] --> B[Operator patches PVC]
+    B --> C[Volume controller expands PV]
+    C --> D[Kubelet resizes filesystem]
+    D --> E[Condition: FileSystemResizePending=False]
+    E --> F[Condition: PVCResizeInProgress=False]
+```
+
+**Status tracking**:
+```yaml
+status:
+  conditions:
+    - type: PVCResizeInProgress
+      status: "True"
+      reason: PVCResizePending
+      message: "One or more PVCs are being resized or waiting for filesystem expansion"
+```
+
+**Events**:
+```bash
+$ kubectl describe rediscluster my-cluster
+Events:
+  Type    Reason              Message
+  ----    ------              -------
+  Normal  PVCResizeStarted    PVC resize started; reconciling requested storage to 20Gi
+  Normal  PVCResizeCompleted  PVC resize completed for all cluster PVCs
+```
+
+### Unusable PVCs
+
+PVCs that cannot be expanded due to:
+- StorageClass does not support `allowVolumeExpansion`
+- StorageClass not found
+
+**Event**:
+```bash
+Events:
+  Type     Reason           Message
+  ----     ------           -------
+  Warning  PVCResizeFailed  Cannot resize PVC my-cluster-data-0 from 10Gi to 20Gi: StorageClass "standard" does not allow volume expansion
+```
+
+The operator emits a warning event but does **not** block reconciliation.
+
+## Volume Expansion Examples
+
+### Expand storage from 10Gi to 50Gi
+
+1. Edit the cluster spec:
+   ```yaml
+   spec:
+     storage:
+       size: 50Gi  # Changed from 10Gi
+   ```
+
+2. Apply the change:
+   ```bash
+   kubectl apply -f rediscluster.yaml
+   ```
+
+3. Monitor expansion:
+   ```bash
+   kubectl get pvc -l redis.io/cluster=my-cluster -w
+   kubectl describe rediscluster my-cluster | grep -A5 Conditions
+   ```
+
+4. Wait for `PVCResizeInProgress` condition to become `False`:
+   ```yaml
+   status:
+     conditions:
+       - type: PVCResizeInProgress
+         status: "False"
+         reason: PVCResizeComplete
+         message: "All PVCs are at the requested storage size"
+   ```
+
+### Check if StorageClass supports expansion
+
+```bash
+kubectl get storageclass fast-ssd -o jsonpath='{.allowVolumeExpansion}'
+# Output: true
+```
+
+If `false` or not set, expansion will fail. Update the StorageClass:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+allowVolumeExpansion: true  # Add this
+```
+
+## Implementation Details
+
+From `internal/controller/cluster/pvcs.go:21-183`:
+
+### PVC Creation
+
+The operator creates PVCs with:
+- **AccessMode**: `ReadWriteOnce`
+- **Labels**: `redis.io/cluster=<cluster-name>`
+- **Requests**: `storage: <spec.storage.size>`
+
+See `pvcs.go:224-253` for the full creation logic.
+
+### Expansion Logic
+
+The operator checks expansion feasibility:
+
+```go
+func (r *ClusterReconciler) canExpandPVC(
+    ctx context.Context,
+    cluster *redisv1.RedisCluster,
+    pvc *corev1.PersistentVolumeClaim,
+) (bool, string, error) {
+    // Get StorageClass
+    // Check allowVolumeExpansion field
+    // Return (expandable, reason, error)
+}
+```
+
+See `pvcs.go:185-211` for the implementation.
+
+### Filesystem Resize Detection
+
+The operator watches for the `FileSystemResizePending` condition:
+
+```go
+func hasFileSystemResizePending(pvc *corev1.PersistentVolumeClaim) bool {
+    for i := range pvc.Status.Conditions {
+        condition := pvc.Status.Conditions[i]
+        if condition.Type == corev1.PersistentVolumeClaimFileSystemResizePending &&
+            condition.Status == corev1.ConditionTrue {
+            return true
+        }
+    }
+    return false
+}
+```
+
+See `pvcs.go:213-222`.
+
+## Best Practices
+
+### Use StorageClasses with expansion enabled
+
+Always configure `allowVolumeExpansion: true` for production clusters:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: redis-storage
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+### Monitor PVC usage
+
+Set up alerts for disk usage:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-pvc-alerts
+spec:
+  groups:
+    - name: redis.storage
+      rules:
+        - alert: RedisPVCNearFull
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes{persistentvolumeclaim=~".*-data-.*"}
+              /
+              kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~".*-data-.*"}
+            ) > 0.85
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+```
+
+### Plan for growth
+
+Expansion is **online** (no downtime), but:
+- Large expansions may take time depending on the storage backend
+- Some cloud providers rate-limit volume modifications
+
+Expand proactively at 70-80% usage rather than waiting for 90%+.
+
+### Clean up dangling PVCs carefully
+
+```bash
+# 1. List dangling PVCs
+kubectl get rediscluster my-cluster -o jsonpath='{.status.danglingPVC[*]}'
+
+# 2. Verify they're not needed (e.g., recent scale-down)
+kubectl get pvc my-cluster-data-3 -o yaml
+
+# 3. Delete if confirmed
+kubectl delete pvc my-cluster-data-3
+```
+
+**Never delete PVCs for active pods** (ordinal < `spec.instances`). This will cause data loss.
+
+## Troubleshooting
+
+### PVC stuck in Pending
+
+**Symptom**:
+```bash
+$ kubectl get pvc
+NAME              STATUS    VOLUME   CAPACITY
+my-cluster-data-0   Pending            
+```
+
+**Causes**:
+1. StorageClass does not exist
+2. No available storage
+3. Node affinity constraints not satisfied
+
+**Debug**:
+```bash
+kubectl describe pvc my-cluster-data-0
+# Look for "ProvisioningFailed" events
+```
+
+### Expansion not completing
+
+**Symptom**:
+```yaml
+status:
+  conditions:
+    - type: PVCResizeInProgress
+      status: "True"  # Stuck here for > 10 minutes
+```
+
+**Debug**:
+```bash
+# Check PVC conditions
+kubectl get pvc my-cluster-data-0 -o jsonpath='{.status.conditions}'
+
+# Check for FileSystemResizePending
+kubectl describe pvc my-cluster-data-0 | grep FileSystemResize
+
+# Verify pod can restart (filesystem resize requires pod restart on some CSI drivers)
+kubectl delete pod my-cluster-0
+```
+
+### Accidental PVC deletion
+
+**Prevention**: Use `reclaimPolicy: Retain` on PersistentVolumes:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: redis-storage
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Retain  # PV survives PVC deletion
+allowVolumeExpansion: true
+```
+
+**Recovery**: If using `Retain`, the PV still exists:
+
+```bash
+# 1. Find the orphaned PV
+kubectl get pv | grep Released
+
+# 2. Remove claimRef to make it Available
+kubectl patch pv <pv-name> -p '{"spec":{"claimRef":null}}'
+
+# 3. Create new PVC with matching volumeName
+```

@@ -1,0 +1,466 @@
+---
+title: RedisCluster CRD
+description: Complete API reference for the RedisCluster custom resource
+---
+
+## Overview
+
+The `RedisCluster` custom resource defines a Redis replication cluster with one primary and N-1 replicas. It supports standalone and sentinel modes.
+
+**API Group:** `redis.io/v1`  
+**Kind:** `RedisCluster`  
+**Short Name:** `rc`
+
+## Spec Fields
+
+### Core Configuration
+
+<ParamField path="instances" type="int32" required>
+  Total number of Redis pods (1 primary + N-1 replicas)
+  
+  **Constraints:**
+  - Minimum: `1`
+  - Default: `1`
+</ParamField>
+
+<ParamField path="mode" type="ClusterMode" default="standalone">
+  Redis operating mode
+  
+  **Enum values:**
+  - `standalone` - Single primary with optional replicas
+  - `sentinel` - Sentinel-managed automatic failover
+  - `cluster` - **Reserved for future use** (currently rejected by webhook)
+</ParamField>
+
+<ParamField path="primaryUpdateStrategy" type="PrimaryUpdateStrategy" default="unsupervised">
+  Controls how the primary is updated during rolling updates
+  
+  **Enum values:**
+  - `unsupervised` - Primary replacement runs automatically after replicas are updated
+  - `supervised` - Waits for operator approval via `redis.io/approve-primary-update` annotation
+</ParamField>
+
+<ParamField path="imageName" type="string" default="redis:7.2">
+  Redis container image (wire-compatible with Valkey 7.x/8.x)
+</ParamField>
+
+### Storage
+
+<ParamField path="storage" type="StorageSpec" required>
+  PVC template for /data volumes
+  
+  <Expandable title="StorageSpec fields">
+    <ParamField path="size" type="resource.Quantity" default="1Gi">
+      Requested storage size (e.g., `10Gi`, `100Gi`)
+    </ParamField>
+    
+    <ParamField path="storageClassName" type="string">
+      Name of the StorageClass to use for PVCs
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Redis Configuration
+
+<ParamField path="redis" type="map[string]string">
+  Redis.conf configuration parameters as key-value pairs
+  
+  **Example:**
+  ```yaml
+  redis:
+    maxmemory: "2gb"
+    maxmemory-policy: "allkeys-lru"
+    tcp-keepalive: "300"
+  ```
+  
+  **Note:** Parameters requiring restart (`bind`, `port`, `tls-port`, `unixsocket`, `databases`) are applied on pod creation but not live-reloaded.
+</ParamField>
+
+<ParamField path="resources" type="corev1.ResourceRequirements">
+  CPU/memory requests and limits for Redis containers
+  
+  **Example:**
+  ```yaml
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  ```
+</ParamField>
+
+### Replication
+
+<ParamField path="minSyncReplicas" type="int32" default="0">
+  Minimum number of synchronous replicas (corresponds to `min-replicas-to-write`)
+  
+  **Constraints:**
+  - Minimum: `0`
+</ParamField>
+
+<ParamField path="maxSyncReplicas" type="int32" default="0">
+  Maximum number of synchronous replicas (corresponds to `min-replicas-max-lag`)
+  
+  **Constraints:**
+  - Minimum: `0`
+</ParamField>
+
+### Secrets
+
+<ParamField path="authSecret" type="LocalObjectReference">
+  Reference to a Secret containing the Redis password in key `password`. If not set, the operator auto-generates one.
+  
+  <Expandable title="LocalObjectReference fields">
+    <ParamField path="name" type="string" required>
+      Name of the Secret in the same namespace
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="aclConfigSecret" type="LocalObjectReference">
+  Reference to a Secret containing ACL rules in key `acl`
+  
+  The instance manager writes this to `/data/users.acl` and issues `ACL LOAD` on changes.
+</ParamField>
+
+<ParamField path="tlsSecret" type="LocalObjectReference">
+  Reference to a Secret containing `tls.crt` and `tls.key` for TLS encryption
+</ParamField>
+
+<ParamField path="caSecret" type="LocalObjectReference">
+  Reference to a Secret containing `ca.crt` for TLS client certificate verification
+</ParamField>
+
+<ParamField path="backupCredentialsSecret" type="LocalObjectReference">
+  Reference to a Secret containing object storage credentials for backups
+  
+  **Expected keys:**
+  - `AWS_ACCESS_KEY_ID` or `aws_access_key_id` or `accessKeyId` or `access_key_id`
+  - `AWS_SECRET_ACCESS_KEY` or `aws_secret_access_key` or `secretAccessKey` or `secret_access_key`
+  - `AWS_SESSION_TOKEN` or `aws_session_token` or `sessionToken` or `session_token` (optional)
+</ParamField>
+
+### High Availability
+
+<ParamField path="enablePodDisruptionBudget" type="bool" default="true">
+  Controls whether a PodDisruptionBudget is created to protect against simultaneous disruptions
+</ParamField>
+
+<ParamField path="primaryIsolation" type="PrimaryIsolationSpec">
+  Configures runtime split-brain prevention for primary pods
+  
+  <Expandable title="PrimaryIsolationSpec fields">
+    <ParamField path="enabled" type="bool" default="true">
+      Controls runtime primary-isolation checks in `/healthz` endpoint
+      
+      When enabled, primary pods fail healthz if they cannot reach both the Kubernetes API server and at least one peer instance.
+    </ParamField>
+    
+    <ParamField path="apiServerTimeout" type="metav1.Duration" default="5s">
+      Timeout for Kubernetes API reachability checks
+    </ParamField>
+    
+    <ParamField path="peerTimeout" type="metav1.Duration" default="5s">
+      Timeout for peer instance-manager reachability checks
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Scheduling
+
+<ParamField path="nodeSelector" type="map[string]string">
+  Constrains pods to nodes with matching labels
+  
+  **Example:**
+  ```yaml
+  nodeSelector:
+    node.kubernetes.io/instance-type: "m5.xlarge"
+  ```
+</ParamField>
+
+<ParamField path="affinity" type="corev1.Affinity">
+  Pod affinity/anti-affinity scheduling rules. See [Kubernetes Affinity docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity).
+</ParamField>
+
+<ParamField path="tolerations" type="[]corev1.Toleration">
+  Allow scheduling onto tainted nodes. See [Kubernetes Tolerations docs](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/).
+</ParamField>
+
+<ParamField path="topologySpreadConstraints" type="[]corev1.TopologySpreadConstraint">
+  Control how pods are spread across topology domains. See [Kubernetes Topology Spread Constraints docs](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/).
+</ParamField>
+
+### Bootstrap
+
+<ParamField path="bootstrap" type="BootstrapSpec">
+  Defines how to initialize the cluster from a backup
+  
+  <Expandable title="BootstrapSpec fields">
+    <ParamField path="backupName" type="string" required>
+      Name of the RedisBackup resource to restore from
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Maintenance
+
+<ParamField path="nodeMaintenanceWindow" type="NodeMaintenanceWindow">
+  Controls planned node maintenance behavior
+  
+  <Expandable title="NodeMaintenanceWindow fields">
+    <ParamField path="inProgress" type="bool" required>
+      Indicates planned node maintenance is currently in progress
+    </ParamField>
+    
+    <ParamField path="reusePVC" type="bool" default="true">
+      Controls whether PVCs are reused during maintenance
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Disaster Recovery (Replica Mode)
+
+<ParamField path="replicaMode" type="ReplicaModeSpec">
+  Configures external replication topology for disaster recovery clusters
+  
+  <Expandable title="ReplicaModeSpec fields">
+    <ParamField path="enabled" type="bool" default="false">
+      Toggles external replication mode for all data pods
+      
+      When enabled, all pods replicate from an external Redis source instead of an internal primary.
+    </ParamField>
+    
+    <ParamField path="source" type="ReplicaSourceSpec">
+      Identifies the external Redis primary to replicate from
+      
+      <Expandable title="ReplicaSourceSpec fields">
+        <ParamField path="clusterName" type="string">
+          Human-readable source cluster identifier (for labeling/events)
+        </ParamField>
+        
+        <ParamField path="host" type="string" required>
+          External Redis endpoint hostname or IP
+        </ParamField>
+        
+        <ParamField path="port" type="int32" default="6379">
+          External Redis port
+          
+          **Constraints:**
+          - Minimum: `1`
+          - Maximum: `65535`
+        </ParamField>
+        
+        <ParamField path="authSecretName" type="string">
+          Name of a Secret with key `password` for upstream authentication
+        </ParamField>
+      </Expandable>
+    </ParamField>
+    
+    <ParamField path="promote" type="bool" default="false">
+      Requests promotion of the local designated leader to standalone primary
+      
+      When set to `true`, the instance manager promotes the current primary out of replica mode by issuing `REPLICAOF NO ONE`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Status Fields
+
+<ResponseField name="phase" type="ClusterPhase">
+  Human-readable cluster phase
+  
+  **Possible values:**
+  - `Creating` - Initial provisioning in progress
+  - `Healthy` - All instances ready and replication healthy
+  - `Degraded` - Some instances not ready or replication lag detected
+  - `Replicating` - External replication active (replica mode)
+  - `FailingOver` - Automatic failover in progress
+  - `Scaling` - Scale-up or scale-down in progress
+  - `Updating` - Rolling update in progress
+  - `WaitingForUser` - Supervised primary update waiting for approval
+  - `Deleting` - Finalizers executing
+  - `Hibernating` - All pods scaled to zero (annotation-triggered)
+</ResponseField>
+
+<ResponseField name="currentPrimary" type="string">
+  Pod name of the current primary instance
+  
+  **Example:** `my-redis-0`
+</ResponseField>
+
+<ResponseField name="readyInstances" type="int32">
+  Count of data pods passing readiness probes
+</ResponseField>
+
+<ResponseField name="sentinelReadyInstances" type="int32">
+  Count of sentinel pods passing readiness probes (sentinel mode only)
+</ResponseField>
+
+<ResponseField name="instances" type="int32">
+  Total number of managed pods
+</ResponseField>
+
+<ResponseField name="instancesStatus" type="map[string]InstanceStatus">
+  Per-pod status map keyed by pod name
+  
+  <Expandable title="InstanceStatus fields">
+    <ResponseField name="role" type="string">
+      `master` or `slave` as reported by Redis `INFO replication`
+    </ResponseField>
+    
+    <ResponseField name="connected" type="bool">
+      Whether the instance manager can reach Redis
+    </ResponseField>
+    
+    <ResponseField name="replicationOffset" type="int64">
+      Current replication offset
+    </ResponseField>
+    
+    <ResponseField name="replicaLagBytes" type="int64">
+      Replication lag in bytes (replicas only)
+    </ResponseField>
+    
+    <ResponseField name="connectedReplicas" type="int32">
+      Number of connected replicas (primary only)
+    </ResponseField>
+    
+    <ResponseField name="masterLinkStatus" type="string">
+      `up` or `down` (replicas only)
+    </ResponseField>
+    
+    <ResponseField name="lastSeenAt" type="metav1.Time">
+      When this status was last reported
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="healthyPVC" type="int32">
+  Count of healthy PersistentVolumeClaims
+</ResponseField>
+
+<ResponseField name="danglingPVC" type="[]string">
+  List of PVC names not attached to any pod
+  
+  Used to detect orphaned storage after scale-down or pod deletion.
+</ResponseField>
+
+<ResponseField name="secretsResourceVersion" type="map[string]string">
+  Maps secret names to their ResourceVersion
+  
+  Used to detect secret rotation and trigger reconciliation.
+</ResponseField>
+
+<ResponseField name="conditions" type="[]metav1.Condition">
+  Latest available observations of the cluster state
+  
+  **Standard condition types:**
+  - `Ready` - Overall cluster health
+  - `PrimaryAvailable` - Primary instance is reachable
+  - `ReplicationHealthy` - All replicas have healthy replication links
+  - `ReplicaMode` - External replication active
+  - `PrimaryUpdateWaiting` - Supervised update waiting for approval
+  - `LastBackupSucceeded` - Most recent backup completed successfully
+  - `Hibernated` - Cluster is hibernated
+  - `MaintenanceInProgress` - Node maintenance window active
+  - `PVCResizeInProgress` - PVC resize operation in progress
+</ResponseField>
+
+## Annotations
+
+### Fencing
+
+**Key:** `redis.io/fencedInstances`
+
+**Value:** JSON array of pod names to fence (stop redis-server)
+
+**Example:**
+```yaml
+annotations:
+  redis.io/fencedInstances: '["my-redis-0", "my-redis-1"]'
+```
+
+Fenced pods have their redis-server process stopped by the instance reconciler.
+
+### Hibernation
+
+**Key:** `redis.io/hibernation`
+
+**Value:** `on` or `true`
+
+**Example:**
+```yaml
+annotations:
+  redis.io/hibernation: "on"
+```
+
+Scales all pods to zero while preserving PVCs.
+
+### Primary Update Approval
+
+**Key:** `redis.io/approve-primary-update`
+
+**Value:** `true`
+
+**Example:**
+```yaml
+annotations:
+  redis.io/approve-primary-update: "true"
+```
+
+Approves a supervised primary update. The operator removes this annotation after promotion completes.
+
+## Labels
+
+The operator applies these labels to all managed resources:
+
+| Label | Values | Description |
+|-------|--------|-------------|
+| `redis.io/cluster` | `<cluster-name>` | RedisCluster name |
+| `redis.io/instance` | `<pod-name>` | Pod name |
+| `redis.io/role` | `primary`, `replica`, `sentinel` | Current role |
+| `redis.io/workload` | `data`, `sentinel` | Workload type |
+
+## Constants
+
+### Sentinel Defaults
+
+```go
+SentinelPort      = 26379
+SentinelInstances = 3
+SentinelQuorum    = 2
+```
+
+## Example
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: my-redis
+  namespace: default
+spec:
+  instances: 3
+  mode: standalone
+  imageName: redis:7.2
+  storage:
+    size: 10Gi
+    storageClassName: fast-ssd
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  redis:
+    maxmemory: "2gb"
+    maxmemory-policy: "allkeys-lru"
+  minSyncReplicas: 1
+  enablePodDisruptionBudget: true
+  primaryIsolation:
+    enabled: true
+    apiServerTimeout: 5s
+    peerTimeout: 5s
+```

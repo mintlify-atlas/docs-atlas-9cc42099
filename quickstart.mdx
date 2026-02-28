@@ -1,80 +1,512 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Deploy your first production-ready Redis cluster in minutes
 ---
 
-## Get started in three steps
+## Overview
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide will walk you through creating a Redis cluster, connecting to it, and performing basic operations. You'll have a working Redis cluster in under 5 minutes.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Before starting, ensure you have [installed the Redis Operator](/installation) and have `kubectl` access to your cluster.
 </Note>
+
+## Create a Redis Cluster
+
+<Steps>
+  <Step title="Create a RedisCluster Resource">
+    Create a file named `my-redis.yaml` with a basic RedisCluster configuration:
+
+    ```yaml my-redis.yaml
+    apiVersion: redis.io/v1
+    kind: RedisCluster
+    metadata:
+      name: my-redis
+      namespace: default
+    spec:
+      instances: 3
+      mode: standalone
+      storage:
+        size: 1Gi
+    ```
+
+    This creates a 3-instance Redis cluster (1 primary + 2 replicas) in standalone mode with 1Gi of persistent storage per instance.
+
+    <Note>
+    The operator automatically defaults `spec.imageName` to `redis:7.2` and `spec.mode` to `standalone` if not specified.
+    </Note>
+
+    Apply the configuration:
+
+    ```bash
+    kubectl apply -f my-redis.yaml
+    ```
+
+    Expected output:
+    ```
+    rediscluster.redis.io/my-redis created
+    ```
+  </Step>
+
+  <Step title="Wait for the Cluster to be Ready">
+    Monitor the cluster status:
+
+    ```bash
+    kubectl get rediscluster my-redis -n default --watch
+    ```
+
+    The cluster progresses through phases:
+    ```
+    NAME        INSTANCES   READY   PHASE       PRIMARY        AGE
+    my-redis    3           0       Creating                   5s
+    my-redis    3           1       Creating    my-redis-2     15s
+    my-redis    3           2       Replicating my-redis-2     25s
+    my-redis    3           3       Healthy     my-redis-2     35s
+    ```
+
+    Wait for the `Ready` count to match `Instances` and `Phase` to be `Healthy`:
+
+    ```bash
+    kubectl wait --for=condition=Ready rediscluster/my-redis -n default --timeout=10m
+    ```
+
+    <Note>
+    The cluster is ready when `status.phase` is `Healthy` and `status.readyInstances` equals `spec.instances`.
+    </Note>
+  </Step>
+
+  <Step title="Verify Cluster Resources">
+    Check the created resources:
+
+    ```bash
+    # View all pods
+    kubectl get pods -n default -l redis.io/cluster=my-redis
+    ```
+
+    Expected output:
+    ```
+    NAME         READY   STATUS    RESTARTS   AGE
+    my-redis-0   1/1     Running   0          60s
+    my-redis-1   1/1     Running   0          60s
+    my-redis-2   1/1     Running   0          60s
+    ```
+
+    ```bash
+    # View services
+    kubectl get svc -n default -l redis.io/cluster=my-redis
+    ```
+
+    Expected output:
+    ```
+    NAME               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+    my-redis-any       ClusterIP   10.96.100.10    <none>        6379/TCP   60s
+    my-redis-leader    ClusterIP   10.96.100.11    <none>        6379/TCP   60s
+    my-redis-replica   ClusterIP   10.96.100.12    <none>        6379/TCP   60s
+    ```
+
+    ```bash
+    # View persistent volumes
+    kubectl get pvc -n default -l redis.io/cluster=my-redis
+    ```
+
+    Expected output:
+    ```
+    NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+    my-redis-0   Bound    pvc-a1b2c3d4-e5f6-7890-abcd-ef1234567890   1Gi        RWO            standard       60s
+    my-redis-1   Bound    pvc-b2c3d4e5-f6a7-8901-bcde-f12345678901   1Gi        RWO            standard       60s
+    my-redis-2   Bound    pvc-c3d4e5f6-a7b8-9012-cdef-123456789012   1Gi        RWO            standard       60s
+    ```
+  </Step>
+</Steps>
+
+## Connect to Redis
+
+<Steps>
+  <Step title="Retrieve the Auto-Generated Password">
+    The operator automatically creates an auth secret named `<cluster-name>-auth`:
+
+    ```bash
+    PASSWORD=$(kubectl get secret my-redis-auth -n default -o jsonpath='{.data.password}' | base64 -d)
+    echo "Redis password: $PASSWORD"
+    ```
+
+    <Note>
+    If you don't specify `spec.authSecret`, the operator generates a random password and stores it in a Secret named `<cluster-name>-auth`.
+    </Note>
+  </Step>
+
+  <Step title="Port-Forward to the Leader Service">
+    Forward port 6379 to the primary Redis instance:
+
+    ```bash
+    kubectl port-forward svc/my-redis-leader 6379:6379 -n default
+    ```
+
+    Keep this terminal open and open a new terminal for the next step.
+  </Step>
+
+  <Step title="Connect with redis-cli">
+    Connect to Redis using the redis-cli:
+
+    ```bash
+    redis-cli -a "$PASSWORD" -h 127.0.0.1 -p 6379 ping
+    ```
+
+    Expected output:
+    ```
+    PONG
+    ```
+
+    Try some basic commands:
+
+    ```bash
+    # Set a key
+    redis-cli -a "$PASSWORD" -h 127.0.0.1 -p 6379 SET mykey "Hello Redis"
+    
+    # Get the key
+    redis-cli -a "$PASSWORD" -h 127.0.0.1 -p 6379 GET mykey
+    
+    # Check replication info
+    redis-cli -a "$PASSWORD" -h 127.0.0.1 -p 6379 INFO replication
+    ```
+  </Step>
+</Steps>
+
+## Service Endpoints
+
+The operator creates three service endpoints per cluster:
+
+<CodeGroup>
+
+```yaml Leader Service
+# my-redis-leader
+# Routes to the current primary pod (status.currentPrimary)
+# Use for: Write operations
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-redis-leader
+spec:
+  selector:
+    redis.io/cluster: my-redis
+    redis.io/role: primary
+  ports:
+  - port: 6379
+    targetPort: 6379
+```
+
+```yaml Replica Service
+# my-redis-replica
+# Routes to read replicas only
+# Use for: Read operations, load distribution
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-redis-replica
+spec:
+  selector:
+    redis.io/cluster: my-redis
+    redis.io/role: replica
+  ports:
+  - port: 6379
+    targetPort: 6379
+```
+
+```yaml Any Service
+# my-redis-any
+# Routes to all data pods (primary + replicas)
+# Use for: Administrative tasks, monitoring
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-redis-any
+spec:
+  selector:
+    redis.io/cluster: my-redis
+    redis.io/workload: data
+  ports:
+  - port: 6379
+    targetPort: 6379
+```
+
+</CodeGroup>
+
+### Connection Strings
+
+Use these service DNS names from within the cluster:
+
+- **Writes**: `my-redis-leader.default.svc.cluster.local:6379`
+- **Reads**: `my-redis-replica.default.svc.cluster.local:6379`
+- **Any instance**: `my-redis-any.default.svc.cluster.local:6379`
+
+## Configuration Examples
+
+### Production Cluster with Resources
+
+<CodeGroup>
+
+```yaml Production
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: prod-redis
+  namespace: production
+spec:
+  instances: 5
+  mode: standalone
+  imageName: redis:7.2
+  
+  storage:
+    size: 50Gi
+    storageClassName: fast-ssd
+  
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  
+  # Synchronous replication
+  minSyncReplicas: 1
+  maxSyncReplicas: 2
+  
+  # Custom Redis configuration
+  redis:
+    maxmemory: "3gb"
+    maxmemory-policy: "allkeys-lru"
+    save: "900 1 300 10 60 10000"
+  
+  # Enable PodDisruptionBudget
+  enablePodDisruptionBudget: true
+  
+  # Spread across availability zones
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        redis.io/cluster: prod-redis
+```
+
+```yaml Sentinel Mode
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: sentinel-redis
+  namespace: default
+spec:
+  instances: 3
+  mode: sentinel
+  
+  storage:
+    size: 10Gi
+  
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  
+  # Sentinel mode creates 3 additional sentinel pods
+  # Sentinel quorum is automatically set to 2
+```
+
+```yaml Custom Auth Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-redis-password
+  namespace: default
+type: Opaque
+stringData:
+  password: "my-secure-password-123"
+---
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: custom-auth-redis
+  namespace: default
+spec:
+  instances: 3
+  mode: standalone
+  
+  storage:
+    size: 5Gi
+  
+  # Reference custom auth secret
+  authSecret:
+    name: my-redis-password
+```
+
+```yaml TLS Enabled
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: tls-redis
+  namespace: default
+spec:
+  instances: 3
+  mode: standalone
+  
+  storage:
+    size: 5Gi
+  
+  # TLS configuration
+  tlsSecret:
+    name: redis-tls-cert
+  
+  caSecret:
+    name: redis-ca-cert
+  
+  redis:
+    tls-port: "6379"
+    port: "0"  # Disable non-TLS port
+    tls-auth-clients: "yes"
+```
+
+</CodeGroup>
+
+## Verify Replication
+
+Check the replication topology:
+
+```bash
+# Get cluster status
+kubectl get rediscluster my-redis -n default -o yaml
+```
+
+Look for `status.currentPrimary` and `status.instancesStatus`:
+
+```yaml status excerpt
+status:
+  phase: Healthy
+  currentPrimary: my-redis-2
+  readyInstances: 3
+  instances: 3
+  instancesStatus:
+    my-redis-0:
+      role: slave
+      connected: true
+      replicationOffset: 12345
+      replicaLagBytes: 0
+      masterLinkStatus: up
+    my-redis-1:
+      role: slave
+      connected: true
+      replicationOffset: 12345
+      replicaLagBytes: 0
+      masterLinkStatus: up
+    my-redis-2:
+      role: master
+      connected: true
+      replicationOffset: 12345
+      connectedReplicas: 2
+```
+
+<Note>
+The operator automatically configures `my-redis-0` and `my-redis-1` as replicas of `my-redis-2` using the `REPLICAOF` command.
+</Note>
+
+## Test Failover
+
+Simulate a primary failure to test automatic failover:
+
+```bash
+# Delete the current primary pod
+PRIMARY=$(kubectl get rediscluster my-redis -n default -o jsonpath='{.status.currentPrimary}')
+kubectl delete pod $PRIMARY -n default
+
+# Watch the cluster recover
+kubectl get rediscluster my-redis -n default --watch
+```
+
+The cluster will:
+1. Detect the primary is unreachable
+2. Fence the old primary (add fencing annotation)
+3. Promote a replica to primary
+4. Update `status.currentPrimary`
+5. Reconfigure remaining replicas
+6. Return to `Healthy` phase
+
+<Note>
+Failover typically completes in under 30 seconds. The operator uses a fencing-first approach to prevent split-brain scenarios.
+</Note>
+
+## Scale the Cluster
+
+Scale up by adding more replicas:
+
+```bash
+kubectl patch rediscluster my-redis -n default --type merge -p '{"spec":{"instances":5}}'
+```
+
+Watch the scale operation:
+
+```bash
+kubectl get rediscluster my-redis -n default --watch
+```
+
+The cluster will:
+1. Enter `Scaling` phase
+2. Create new PVCs and Pods
+3. Configure new pods as replicas
+4. Return to `Healthy` phase when all instances are ready
+
+## Clean Up
+
+Delete the Redis cluster:
+
+```bash
+kubectl delete rediscluster my-redis -n default
+```
+
+<Warning>
+Deleting a RedisCluster resource deletes the Pods, Services, and ConfigMaps. By default, PVCs are retained to prevent accidental data loss. Delete PVCs manually if you want to remove all data.
+</Warning>
+
+To delete PVCs:
+
+```bash
+kubectl delete pvc -n default -l redis.io/cluster=my-redis
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Explore all RedisCluster configuration options
+  </Card>
+  <Card
+    title="Backup & Restore"
+    icon="floppy-disk"
+    href="/backup-restore"
+  >
+    Learn how to backup and restore Redis data
+  </Card>
+  <Card
+    title="Monitoring"
+    icon="chart-line"
+    href="/monitoring"
+  >
+    Set up Prometheus metrics and Grafana dashboards
+  </Card>
+  <Card
+    title="Runbooks"
+    icon="book"
+    href="/runbooks"
+  >
+    Operational guides for common scenarios
+  </Card>
+</CardGroup>

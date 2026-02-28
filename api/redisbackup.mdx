@@ -1,0 +1,196 @@
+---
+title: RedisBackup CRD
+description: API reference for the RedisBackup custom resource
+---
+
+## Overview
+
+The `RedisBackup` custom resource defines an on-demand backup of a RedisCluster to object storage.
+
+**API Group:** `redis.io/v1`  
+**Kind:** `RedisBackup`  
+**Short Name:** `rb`
+
+## Spec Fields
+
+<ParamField path="clusterName" type="string" required>
+  Name of the RedisCluster to back up
+</ParamField>
+
+<ParamField path="target" type="BackupTarget" default="prefer-replica">
+  Specifies which pod to run the backup on
+  
+  **Enum values:**
+  - `primary` - Always run backup on the primary instance
+  - `prefer-replica` - Run on a replica if available, otherwise on the primary
+</ParamField>
+
+<ParamField path="method" type="BackupMethod" default="rdb">
+  Backup method to use
+  
+  **Enum values:**
+  - `rdb` - Redis Database file (point-in-time snapshot via `BGSAVE`)
+  - `aof` - Append-only file (via `BGREWRITEAOF`, archived as `.tar.gz`)
+</ParamField>
+
+<ParamField path="destination" type="BackupDestination">
+  Defines where to store the backup
+  
+  <Expandable title="BackupDestination fields">
+    <ParamField path="s3" type="S3Destination">
+      S3-compatible storage destination
+      
+      <Expandable title="S3Destination fields">
+        <ParamField path="bucket" type="string" required>
+          S3 bucket name
+        </ParamField>
+        
+        <ParamField path="path" type="string">
+          Prefix/path within the bucket
+          
+          **Example:** `backups/redis` results in objects like `s3://my-bucket/backups/redis/my-backup.rdb`
+        </ParamField>
+        
+        <ParamField path="endpoint" type="string">
+          S3 endpoint URL for non-AWS S3-compatible stores (e.g., MinIO, Ceph)
+          
+          **Example:** `https://minio.example.com`
+        </ParamField>
+        
+        <ParamField path="region" type="string">
+          AWS region (defaults to `us-east-1` if not specified)
+        </ParamField>
+      </Expandable>
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Status Fields
+
+<ResponseField name="phase" type="BackupPhase">
+  Current backup phase
+  
+  **Possible values:**
+  - `Pending` - Backup scheduled but not started
+  - `Running` - Backup in progress
+  - `Completed` - Backup completed successfully
+  - `Failed` - Backup failed (see `error` field)
+</ResponseField>
+
+<ResponseField name="targetPod" type="string">
+  Pod name that is running or ran the backup
+  
+  **Example:** `my-redis-1`
+</ResponseField>
+
+<ResponseField name="startedAt" type="metav1.Time">
+  When the backup started
+</ResponseField>
+
+<ResponseField name="completedAt" type="metav1.Time">
+  When the backup completed (success or failure)
+</ResponseField>
+
+<ResponseField name="backupSize" type="int64">
+  Size of the backup in bytes
+</ResponseField>
+
+<ResponseField name="backupPath" type="string">
+  Object storage path/key where the backup is written
+  
+  **Example:** `s3://my-bucket/backups/my-backup.rdb`
+</ResponseField>
+
+<ResponseField name="artifactType" type="BackupArtifactType">
+  Format of the backup artifact in object storage
+  
+  **Enum values:**
+  - `rdb` - Redis Database file (`.rdb`)
+  - `aof-archive` - AOF directory archived as `.aof.tar.gz`
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error message if the backup failed
+</ResponseField>
+
+<ResponseField name="conditions" type="[]metav1.Condition">
+  Latest available observations
+</ResponseField>
+
+## Backup Workflow
+
+### RDB Backups
+
+1. Operator selects target pod based on `spec.target`
+2. Operator POSTs to `/v1/backup` on target pod's IP
+3. Instance manager issues `BGSAVE` to Redis
+4. Instance manager polls `INFO persistence` until `rdb_bgsave_in_progress=0`
+5. Instance manager reads `/data/dump.rdb`
+6. Instance manager uploads to S3 with SHA256 checksum
+7. Operator updates status with `backupPath`, `backupSize`, `checksumSHA256`
+
+### AOF Backups
+
+1. Operator selects target pod based on `spec.target`
+2. Operator POSTs to `/v1/backup` on target pod's IP
+3. Instance manager issues `BGREWRITEAOF` to Redis
+4. Instance manager polls `INFO persistence` until `aof_rewrite_in_progress=0`
+5. Instance manager creates `.tar.gz` archive of `/data/appendonlydir/`
+6. Instance manager uploads to S3 with SHA256 checksum
+7. Instance manager deletes temporary archive file
+8. Operator updates status with `backupPath`, `backupSize`, `checksumSHA256`
+
+## Credentials
+
+Backup credentials are mounted from the Secret referenced in `spec.backupCredentialsSecret` at `/backup-credentials`.
+
+The instance manager supports multiple key names for AWS credentials:
+
+| Credential | Supported Keys |
+|------------|----------------|
+| Access Key ID | `AWS_ACCESS_KEY_ID`, `aws_access_key_id`, `accessKeyId`, `access_key_id` |
+| Secret Access Key | `AWS_SECRET_ACCESS_KEY`, `aws_secret_access_key`, `secretAccessKey`, `secret_access_key` |
+| Session Token | `AWS_SESSION_TOKEN`, `aws_session_token`, `sessionToken`, `session_token` |
+
+**Example Secret:**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-backup-creds
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+  AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+## Example
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisBackup
+metadata:
+  name: my-backup
+  namespace: default
+spec:
+  clusterName: my-redis
+  target: prefer-replica
+  method: rdb
+  destination:
+    s3:
+      bucket: my-backup-bucket
+      path: redis-backups
+      region: us-west-2
+```
+
+**Status after completion:**
+```yaml
+status:
+  phase: Completed
+  targetPod: my-redis-1
+  startedAt: "2026-02-28T10:00:00Z"
+  completedAt: "2026-02-28T10:01:23Z"
+  backupSize: 1073741824
+  backupPath: s3://my-backup-bucket/redis-backups/my-backup.rdb
+  artifactType: rdb
+```

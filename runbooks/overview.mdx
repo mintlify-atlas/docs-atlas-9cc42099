@@ -1,0 +1,29 @@
+---
+title: Operational Runbooks
+description: Incident response and production operations procedures for RedisCluster resources
+---
+
+These runbooks are for incident response and production operations of `RedisCluster` resources managed by this operator.
+
+## Runbook Index
+
+| Scenario | Runbook |
+| --- | --- |
+| Manual failover when operator is unavailable | [Manual Failover](/runbooks/manual-failover) |
+| Reconciler loop appears stuck | [Stuck Reconciler](/runbooks/stuck-reconciler) |
+| All data pods lost, PVCs intact | [Total Cluster Loss](/runbooks/total-cluster-loss) |
+| Single corrupted replica PVC | [PVC Corruption](/runbooks/pvc-corruption) |
+| Suspected split-brain (two primaries) | [Split-Brain Recovery](/runbooks/split-brain-recovery) |
+| Rotate `authSecret` without pod restarts | [Secret Rotation](/runbooks/secret-rotation) |
+| Upgrade operator safely | [Operator Upgrade](/runbooks/operator-upgrade) |
+
+## Shared Conventions
+
+<Warning>
+  Set shell variables before executing commands:
+  - `NS=<rediscluster namespace>`
+  - `CLUSTER=<rediscluster name>`
+</Warning>
+
+- Prefer touching annotations to force immediate reconciliation; the controller also reconciles periodically.
+- Validate the cluster has returned to `status.phase=Healthy` before closing the incident.

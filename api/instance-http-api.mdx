@@ -1,0 +1,346 @@
+---
+title: Instance Manager HTTP API
+description: HTTP endpoints exposed by the in-pod instance manager
+---
+
+## Overview
+
+Each Redis data pod runs an instance manager process that exposes an HTTP API on port `8080`. The operator communicates with instance managers via **pod IP directly** (never through Services) for precise targeting.
+
+**Base URL:** `http://<pod-ip>:8080`
+
+**Authentication:** None (internal cluster communication)
+
+## Health Endpoints
+
+### GET /healthz
+
+Liveness probe endpoint with runtime primary isolation detection.
+
+**Response:**
+- `200 OK` - Process is alive and healthy
+- `503 Service Unavailable` - Process not running or primary is isolated
+
+**Primary Isolation Logic:**
+
+For primary pods with `spec.primaryIsolation.enabled=true`:
+1. Check if redis-server process is running
+2. Query Redis `INFO replication` to confirm role is `master`
+3. Attempt to reach Kubernetes API server (timeout: `spec.primaryIsolation.apiServerTimeout`)
+4. If API unreachable, attempt to reach at least one peer instance manager (timeout: `spec.primaryIsolation.peerTimeout`)
+5. Return `503` if both API and all peers are unreachable (primary is isolated)
+
+**Example:**
+```bash
+curl http://10.244.0.5:8080/healthz
+# Response: ok
+```
+
+**Isolation response:**
+```bash
+curl http://10.244.0.5:8080/healthz
+# Response: primary isolated: cannot reach API server or any peer
+# Status: 503
+```
+
+---
+
+### GET /readyz
+
+Readiness probe endpoint.
+
+**Response:**
+- `200 OK` - Redis responds to PING
+- `503 Service Unavailable` - Redis not ready
+
+**Example:**
+```bash
+curl http://10.244.0.5:8080/readyz
+# Response: ok
+```
+
+---
+
+## Replication Endpoints
+
+### GET /v1/status
+
+Returns current replication status for the operator's status collection.
+
+**Method:** `GET`
+
+**Response Schema:**
+
+<ResponseField name="role" type="string" required>
+  `master` or `slave` from Redis `INFO replication`
+</ResponseField>
+
+<ResponseField name="replicationOffset" type="int64" required>
+  Current replication offset (`master_repl_offset` for primary, `slave_repl_offset` for replica)
+</ResponseField>
+
+<ResponseField name="connectedReplicas" type="int" required>
+  Number of connected replicas (primary only, otherwise `0`)
+</ResponseField>
+
+<ResponseField name="masterLinkStatus" type="string">
+  `up` or `down` (replicas only, omitted for primary)
+</ResponseField>
+
+<ResponseField name="connected" type="bool" required>
+  Always `true` (if endpoint responds)
+</ResponseField>
+
+**Example Request:**
+```bash
+curl http://10.244.0.5:8080/v1/status
+```
+
+**Example Response (Primary):**
+```json
+{
+  "role": "master",
+  "replicationOffset": 123456789,
+  "connectedReplicas": 2,
+  "connected": true
+}
+```
+
+**Example Response (Replica):**
+```json
+{
+  "role": "slave",
+  "replicationOffset": 123456780,
+  "connectedReplicas": 0,
+  "masterLinkStatus": "up",
+  "connected": true
+}
+```
+
+---
+
+### POST /v1/promote
+
+Promotes a replica to primary by issuing `REPLICAOF NO ONE`.
+
+**Method:** `POST`
+
+**Request Body:** None
+
+**Response:**
+- `200 OK` - Promotion succeeded
+- `500 Internal Server Error` - Promotion failed
+
+**Example:**
+```bash
+curl -X POST http://10.244.0.6:8080/v1/promote
+# Response: promoted
+```
+
+---
+
+### POST /v1/demote
+
+Demotes an instance to replica by issuing `REPLICAOF <primaryIP> <port>`.
+
+**Method:** `POST`
+
+**Query Parameters:**
+
+<ParamField path="primaryIP" type="string" required>
+  IP address of the primary instance
+</ParamField>
+
+<ParamField path="port" type="int" default="6379">
+  Port of the primary instance
+</ParamField>
+
+**Response:**
+- `200 OK` - Demotion succeeded
+- `400 Bad Request` - Missing or invalid parameters
+- `500 Internal Server Error` - Demotion failed
+
+**Example:**
+```bash
+curl -X POST "http://10.244.0.7:8080/v1/demote?primaryIP=10.244.0.5&port=6379"
+# Response: demoted
+```
+
+---
+
+## Backup Endpoint
+
+### POST /v1/backup
+
+Executes a backup and uploads to object storage.
+
+**Method:** `POST`
+
+**Request Schema:**
+
+<ParamField path="backupName" type="string" required>
+  Name of the RedisBackup resource (used for object key generation)
+</ParamField>
+
+<ParamField path="method" type="BackupMethod" default="rdb">
+  Backup method
+  
+  **Enum values:**
+  - `rdb` - BGSAVE
+  - `aof` - BGREWRITEAOF
+</ParamField>
+
+<ParamField path="destination" type="BackupDestination" required>
+  Object storage destination
+  
+  <Expandable title="BackupDestination schema">
+    <ParamField path="s3" type="S3Destination" required>
+      <Expandable title="S3Destination schema">
+        <ParamField path="bucket" type="string" required>
+          S3 bucket name
+        </ParamField>
+        
+        <ParamField path="path" type="string">
+          Path prefix within bucket
+        </ParamField>
+        
+        <ParamField path="endpoint" type="string">
+          S3 endpoint URL (for non-AWS S3)
+        </ParamField>
+        
+        <ParamField path="region" type="string">
+          AWS region (defaults to `us-east-1`)
+        </ParamField>
+      </Expandable>
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+**Response Schema:**
+
+<ResponseField name="artifactType" type="BackupArtifactType" required>
+  Format of uploaded artifact
+  
+  **Values:**
+  - `rdb` - RDB file
+  - `aof-archive` - AOF directory as `.tar.gz`
+</ResponseField>
+
+<ResponseField name="backupPath" type="string" required>
+  Full S3 URI of uploaded backup
+  
+  **Example:** `s3://my-bucket/backups/my-backup.rdb`
+</ResponseField>
+
+<ResponseField name="objectKey" type="string" required>
+  Object key within bucket
+  
+  **Example:** `backups/my-backup.rdb`
+</ResponseField>
+
+<ResponseField name="backupSize" type="int64" required>
+  Size of uploaded artifact in bytes
+</ResponseField>
+
+<ResponseField name="checksumSHA256" type="string">
+  SHA256 checksum of uploaded artifact
+</ResponseField>
+
+**Example Request:**
+```bash
+curl -X POST http://10.244.0.6:8080/v1/backup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "backupName": "my-backup",
+    "method": "rdb",
+    "destination": {
+      "s3": {
+        "bucket": "my-backup-bucket",
+        "path": "redis-backups",
+        "region": "us-west-2"
+      }
+    }
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "artifactType": "rdb",
+  "backupPath": "s3://my-backup-bucket/redis-backups/my-backup.rdb",
+  "objectKey": "redis-backups/my-backup.rdb",
+  "backupSize": 1073741824,
+  "checksumSHA256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+```
+
+**Workflow:**
+
+#### RDB Method
+1. Issue `BGSAVE` to Redis
+2. Poll `INFO persistence` every 250ms until `rdb_bgsave_in_progress=0`
+3. Verify `rdb_last_bgsave_status=ok`
+4. Read `/data/dump.rdb`
+5. Upload to S3 with computed SHA256
+6. Return response
+
+#### AOF Method
+1. Issue `BGREWRITEAOF` to Redis
+2. Poll `INFO persistence` every 250ms until `aof_rewrite_in_progress=0`
+3. Verify `aof_last_bgrewrite_status=ok`
+4. Create `.tar.gz` archive of `/data/appendonlydir/`
+5. Upload to S3 with computed SHA256
+6. Delete temporary archive file
+7. Return response
+
+**Timeout:** 5 minutes (300 seconds)
+
+**Credentials:** Loaded from `/backup-credentials` mount (see [RedisBackup credentials](/api/redisbackup#credentials))
+
+---
+
+## Metrics Endpoint
+
+### GET /metrics
+
+Prometheus metrics endpoint exposing Redis metrics scraped from `INFO` command.
+
+**Method:** `GET`
+
+**Response Format:** Prometheus text format
+
+**Example:**
+```bash
+curl http://10.244.0.5:8080/metrics
+```
+
+**Sample Metrics:**
+```
+# HELP redis_up Whether the Redis server is up
+# TYPE redis_up gauge
+redis_up{cluster="my-redis",namespace="default",pod="my-redis-0"} 1
+
+# HELP redis_connected_replicas Number of connected replicas
+# TYPE redis_connected_replicas gauge
+redis_connected_replicas{cluster="my-redis",namespace="default",pod="my-redis-0"} 2
+
+# HELP redis_replication_offset_bytes Current replication offset
+# TYPE redis_replication_offset_bytes gauge
+redis_replication_offset_bytes{cluster="my-redis",namespace="default",pod="my-redis-0"} 123456789
+```
+
+**Labels:**
+- `cluster` - RedisCluster name
+- `namespace` - Kubernetes namespace
+- `pod` - Pod name
+
+---
+
+## Sentinel Endpoints
+
+Sentinel pods expose a minimal HTTP API:
+
+- `GET /healthz` - Process liveness (checks redis-sentinel process)
+- `GET /readyz` - Redis Sentinel PING check
+
+Sentinel pods do **not** expose `/v1/*` or `/metrics` endpoints.

@@ -1,0 +1,221 @@
+---
+title: Design Principles
+description: CloudNativePG-inspired design philosophy
+---
+
+## Inspiration: CloudNativePG
+
+Redis Operator is heavily inspired by [CloudNativePG](https://cloudnative-pg.io), the Cloud Native PostgreSQL operator. The core design philosophy borrows from CNPG's approach to stateful workload management:
+
+- **Safety first**: Prevent split-brain and data loss through fencing and boot-time guards
+- **Direct lifecycle control**: Manage Pods and PVCs directly instead of relying on StatefulSets
+- **Declarative reconciliation**: Converge toward desired state, not imperative commands
+- **Operational observability**: Rich per-instance status for debugging and automation
+- **Minimal RBAC**: Instance managers run with read-only access to their own cluster CR
+
+<Note>
+Just as CloudNativePG uses `pg_rewind` to ensure a former primary unconditionally follows the new primary on recovery, Redis Operator uses boot-time `REPLICAOF` enforcement to prevent self-election.
+</Note>
+
+## Core Principles
+
+### 1. Fencing-First Failover
+
+**Problem**: During failover, if the old primary recovers while a new primary is being promoted, both may accept writes (split-brain).
+
+**Solution**: Always fence the old primary **before** promoting a new one.
+
+**Implementation**:
+
+1. Operator detects primary is unreachable (HTTP poll timeout/error)
+2. **Fence the former primary** — Set the fence annotation on `RedisCluster` for that pod
+3. Select the replica with the smallest replication lag
+4. Issue `POST /v1/promote` to that replica's pod IP
+5. Instance manager runs `REPLICAOF NO ONE`
+6. Operator updates `-leader` Service selector to the new primary
+7. Operator updates `cluster.status.currentPrimary`
+8. Operator removes the fence annotation from the former primary
+9. Former primary pod restarts; instance manager detects it is no longer `currentPrimary` and starts as a replica
+
+See `internal/controller/cluster/fencing.go:49-58`.
+
+<Warning>
+**Hard invariant**: Fencing annotation goes on **before** promoting a replica. Never promote without fencing first.
+</Warning>
+
+### 2. Boot-Time Split-Brain Guard
+
+The fencing-first sequence is the **primary** defense. The instance manager provides a **second line of defense** at startup.
+
+**Boot-time role check** (`internal/instance-manager/run/run.go:63-66`):
+
+On every cold start, before `redis-server` is launched, the instance manager compares `POD_NAME` against `cluster.status.currentPrimary`:
+
+- **Match** → Start as primary (no `replicaof` directive in `redis.conf`)
+- **No match** → Always start with `replicaof <currentPrimary-ip> 6379`, **regardless of any local data state**
+
+Redis will perform a partial resync (`PSYNC`) or full `SYNC` as needed. Any data the former primary wrote after the failover is **discarded**, matching CNPG's `pg_rewind` behavior.
+
+<Info>
+This ensures a recovering former primary can **never self-elect**: it unconditionally follows `status.currentPrimary` on boot.
+</Info>
+
+### 3. Direct Pod/PVC Management
+
+**Why not StatefulSets?**
+
+StatefulSets provide ordering guarantees and stable network identities, but impose constraints that conflict with Redis-specific operational requirements:
+
+| StatefulSet Constraint | Redis Operator Need |
+|------------------------|---------------------|
+| Updates pods in ascending order (0, 1, 2...) | Replicas must update before the primary |
+| Immutable `volumeClaimTemplates` | PVC resizing and replacement without cluster recreation |
+| Generic lifecycle hooks | Redis-specific fencing, switchover, and promotion logic |
+| No pod-specific configuration | Each pod needs distinct `redis.conf` (primary vs replica) |
+
+**Direct Pod/PVC management enables**:
+
+- **Replica-first rolling updates**: Update replicas in reverse ordinal order (highest first), then promote a replica to primary and delete the old primary last
+- **Supervised primary updates**: Pause before touching the primary, wait for explicit user approval via annotation
+- **Immediate PVC updates**: Resize or replace PVCs without StatefulSet recreation
+- **Fencing**: Stop specific pods on-demand by setting an annotation
+
+See `internal/controller/cluster/pods.go` and `internal/controller/cluster/pvcs.go`.
+
+### 4. Pod-Precise Control Plane
+
+**Problem**: Services load-balance traffic. Calling a Service endpoint to promote a replica might hit the wrong pod.
+
+**Solution**: The controller always calls instance manager HTTP endpoints via **pod IP**, never through a Service.
+
+**Example** (`internal/controller/cluster/fencing.go`):
+
+```go
+// Promote the selected replica by calling its pod IP directly
+url := fmt.Sprintf("http://%s:9121/v1/promote", replicaPodIP)
+resp, err := http.Post(url, "application/json", nil)
+```
+
+This ensures:
+
+- **Deterministic operations**: Promotion, backup, and status polling target the exact pod the controller intends
+- **No race conditions**: Load balancers can't route critical commands to the wrong instance
+- **Simpler debugging**: Logs clearly show which pod received which command
+
+<Note>
+Services (`-leader`, `-replica`, `-any`) are still created for **client application traffic**, but the operator bypasses them for control-plane operations.
+</Note>
+
+### 5. Secrets as Projected Volumes
+
+**Why not environment variables?**
+
+- **Security**: Environment variables are visible in pod specs, logs, and crash dumps
+- **Rotation**: Kubernetes automatically updates projected volume content; env vars require pod restarts
+- **Multi-key secrets**: TLS secrets contain both `tls.crt` and `tls.key`; projected volumes support multiple files from one secret
+
+**How it works**:
+
+1. Secrets are mounted as projected volumes at `/projected` and `/tls`
+2. Kubernetes syncs secret updates to the pod filesystem (within ~60 seconds)
+3. The instance manager reconciler watches for file changes
+4. Changes are applied live via `CONFIG SET` or `ACL LOAD` (no pod restart)
+
+See `internal/controller/cluster/secrets.go:33-41` and `internal/instance-manager/reconciler/reconciler.go`.
+
+### 6. Status as Source of Truth
+
+**Principle**: The `status` subresource is the **only** source of truth for runtime state. The `spec` declares desired state; the `status` reflects observed reality.
+
+**Per-pod status tracking** (`api/v1/rediscluster_types.go:319-322`):
+
+```go
+// InstancesStatus is a per-pod status map keyed by pod name.
+// Using a map (not slice) to avoid strategic-merge-patch ordering issues.
+InstancesStatus map[string]InstanceStatus `json:"instancesStatus,omitempty"`
+```
+
+**Why a map, not a slice?**
+
+- **Stable keys**: Pod names are immutable; slice indexes shift during scaling
+- **Strategic merge patch safety**: Kubernetes merges maps by key; slices can experience ordering bugs
+- **Direct access**: `status.instancesStatus["redis-0"]` is more explicit than `status.instancesStatus[0]`
+
+**What's tracked per instance**:
+
+- Redis role (`master` or `slave`)
+- Connectivity status
+- Replication offset and lag
+- Connected replicas (primary only)
+- Master link status (replicas only)
+- Last seen timestamp
+
+See `internal/controller/cluster/status.go`.
+
+### 7. Reconciliation Order Discipline
+
+**Hard invariant**: Sub-steps in `reconcile()` execute in a **fixed order**. Do not reorder.
+
+**Why it matters**:
+
+1. **Secret resolution before pod creation**: Pods must mount the latest secret versions
+2. **Services before status polling**: The `-leader` Service must exist before clients connect
+3. **Status polling before pod reconciliation**: Scaling/failover decisions depend on live instance state
+4. **PVC reconciliation before pod reconciliation**: Pods require PVCs to be ready
+
+**Reconciliation order** (`internal/controller/cluster/reconciler.go:7-17`):
+
+1. Global resources (ServiceAccount, RBAC, ConfigMap, PDB)
+2. Secret resolution
+3. Services
+4. HTTP status poll
+5. Status update
+6. Reachability check
+7. PVC reconciliation
+8. Pod reconciliation
+
+<Warning>
+Adding new reconciliation steps must respect this order. Insert new steps at the appropriate position; do not append to the end unless the step truly has no dependencies.
+</Warning>
+
+### 8. Errors vs. Requeues
+
+**Principle**: Return `ctrl.Result{RequeueAfter: ...}` for expected-transient states; return an error **only** for unexpected failures.
+
+**Examples**:
+
+| Scenario | Return |
+|----------|--------|
+| Pod is still pending | `ctrl.Result{RequeueAfter: 5*time.Second}` |
+| Secret not found (user will create it) | `ctrl.Result{RequeueAfter: 10*time.Second}` |
+| HTTP status poll timeout (pod is starting) | `ctrl.Result{RequeueAfter: 2*time.Second}` |
+| Failed to create Pod (API error) | `error` |
+| Failed to update status subresource | `error` |
+
+**Why this matters**:
+
+- **Errors** increment failure counters and trigger exponential backoff; use them for bugs or API failures
+- **Requeues** are normal operational delays; use them for waiting on asynchronous state changes
+
+See `internal/controller/cluster/reconciler.go`.
+
+## Comparison with StatefulSet-Based Operators
+
+See [Comparison with Other Redis Operators](/concepts/comparison) for a detailed comparison with OpsTree Redis Operator and other alternatives.
+
+## Hard Invariants
+
+These rules are enforced by code review and must never be broken:
+
+1. **Context-first**: `context.Context` is always the first argument on any function that does I/O, network calls, or Kubernetes API calls
+2. **No panics**: Errors are returned, not panicked; use `errors.Is`/`errors.As` for error matching
+3. **Pod IP targeting**: Operator-to-pod communication always uses the pod IP directly, never a Service
+4. **Boot-time guard**: The split-brain guard in `internal/instance-manager/run/run.go` must fire **before** `redis-server` starts
+5. **Fence-first**: Fencing annotation goes on **before** promoting a replica
+6. **Status-only updates**: Status is updated via `status` subresource only (separate from spec)
+7. **Map-based status**: Per-pod state lives in a map keyed by pod name, never a slice
+8. **Replica-first updates**: Rolling updates always process replicas before the primary (highest ordinal first)
+9. **Projected volumes only**: Secrets are injected as projected volumes, never env vars
+10. **No cluster mode (yet)**: `spec.mode: cluster` is reserved and rejected by the webhook
+
+See `AGENTS.md:16-25` for the complete list.

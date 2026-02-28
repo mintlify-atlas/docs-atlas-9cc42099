@@ -1,122 +1,103 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Redis Operator",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#DC382D",
+    "light": "#FF6B6B",
+    "dark": "#A41E11"
   },
-  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/howl-cloud/redis-operator"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/howl-cloud/redis-operator"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "introduction",
+              "installation",
+              "quickstart"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/architecture",
+              "concepts/design-principles",
+              "concepts/cluster-modes",
+              "concepts/failover-and-fencing",
+              "concepts/comparison"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Configuration",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "configuration/cluster-spec",
+              "configuration/storage",
+              "configuration/secrets",
+              "configuration/scheduling",
+              "configuration/sentinel-mode",
+              "configuration/replica-mode"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Operations",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "operations/monitoring",
+              "operations/backups",
+              "operations/upgrades",
+              "operations/maintenance",
+              "operations/scaling",
+              "operations/performance"
+            ]
+          },
+          {
+            "group": "Runbooks",
+            "pages": [
+              "runbooks/overview",
+              "runbooks/manual-failover",
+              "runbooks/split-brain-recovery",
+              "runbooks/pvc-corruption",
+              "runbooks/total-cluster-loss",
+              "runbooks/secret-rotation",
+              "runbooks/stuck-reconciler",
+              "runbooks/operator-upgrade"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Custom Resources",
             "pages": [
-              "api-reference/introduction"
+              "api/rediscluster",
+              "api/redisbackup",
+              "api/redisscheduledbackup"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Instance Manager",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/instance-http-api",
+              "api/instance-reconciler"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

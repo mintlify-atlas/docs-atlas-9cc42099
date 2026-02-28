@@ -1,0 +1,464 @@
+---
+title: Upgrades
+description: Upgrade operator and Redis clusters safely
+---
+
+This guide covers upgrading the Redis Operator and managed Redis clusters.
+
+## Operator Upgrades
+
+Operator upgrades use controlled rolling deployment with leader election for zero-downtime control plane handoff.
+
+### What Happens During an Operator Upgrade
+
+<Steps>
+  <Step title="New controller pod starts">
+    Kubernetes rolls out a new operator Deployment pod with the updated image.
+  </Step>
+  
+  <Step title="Leader election handoff">
+    Leader election ensures only one active controller at a time. The new pod acquires the lease after the old pod terminates.
+  </Step>
+  
+  <Step title="Reconciliation continues">
+    The new controller resumes reconciliation of all `RedisCluster` resources without interruption.
+  </Step>
+  
+  <Step title="Pod hash recalculation">
+    The reconciler computes a `redis.io/spec-hash` annotation for each data pod based on:
+    - Redis image
+    - Redis container resources
+    - Operator init container image (`OPERATOR_IMAGE_NAME`)
+    - Projected secret references
+    - Redis config from `.spec.redis`
+  </Step>
+  
+  <Step title="Rolling update triggered (if needed)">
+    If the spec hash changes, data pods are updated one at a time:
+    1. Replicas first (highest ordinal to lowest)
+    2. Primary last (via controlled switchover)
+  </Step>
+</Steps>
+
+<Note>
+Data pods are **not** restarted unless their spec hash changes. A pure operator code upgrade does not restart Redis instances.
+</Note>
+
+## API Versioning and Compatibility
+
+### Current State
+
+- The CRD API currently serves `redis.io/v1`
+- No active multi-version CRD setup
+- No conversion webhook in the current release
+
+### Compatibility Policy
+
+The operator follows these principles to avoid data loss and API breakage:
+
+1. **Additive changes** - New fields are always `+optional`, new enum values added where safe
+2. **Deprecation window** - Fields are marked deprecated for at least one full release before removal
+3. **Backward compatibility** - Reconcile logic remains compatible for deprecated fields during deprecation period
+4. **Conversion webhooks** - Only introduced when a new CRD version (e.g., `v2`) is added alongside `v1`
+
+<Warning>
+Never remove persisted fields without a deprecation window. This can cause data loss for existing clusters.
+</Warning>
+
+## Helm Upgrade Procedure
+
+### Pre-Upgrade Checklist
+
+<Steps>
+  <Step title="Backup critical data">
+    Create on-demand backups of all production clusters:
+    
+    ```bash
+    kubectl apply -f - <<EOF
+    apiVersion: redis.io/v1
+    kind: RedisBackup
+    metadata:
+      name: pre-upgrade-backup-$(date +%s)
+      namespace: default
+    spec:
+      clusterName: my-cluster
+      target: prefer-replica
+      method: rdb
+      destination:
+        s3:
+          bucket: redis-backups
+          path: pre-upgrade/
+          region: us-east-1
+    EOF
+    ```
+  </Step>
+  
+  <Step title="Snapshot current state">
+    Record current cluster state:
+    
+    ```bash
+    kubectl get redisclusters.redis.io -A -o wide > clusters-before.txt
+    kubectl get pods -A -l redis.io/cluster -o wide > pods-before.txt
+    kubectl get events -A --field-selector involvedObject.kind=RedisCluster \
+      --sort-by=.lastTimestamp | tail -n 50 > events-before.txt
+    ```
+  </Step>
+  
+  <Step title="Note current primary pods">
+    Document which pods are currently primary:
+    
+    ```bash
+    kubectl get redisclusters -A \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.currentPrimary}{"\n"}{end}' \
+      > primaries-before.txt
+    ```
+  </Step>
+  
+  <Step title="Review changelog">
+    Check the operator CHANGELOG.md for breaking changes, required actions, or CRD updates.
+  </Step>
+</Steps>
+
+### Performing the Upgrade
+
+<Steps>
+  <Step title="Update CRDs (if changed)">
+    If the new version includes CRD changes, apply them first:
+    
+    ```bash
+    kubectl apply -f https://github.com/howl-cloud/redis-operator/releases/download/v1.x.x/crds.yaml
+    ```
+    
+    Or from the Helm chart:
+    
+    ```bash
+    kubectl apply -f charts/redis-operator/crds/
+    ```
+  </Step>
+  
+  <Step title="Upgrade Helm release">
+    ```bash
+    helm upgrade redis-operator charts/redis-operator \
+      --namespace redis-system \
+      --reuse-values \
+      --set image.tag=1.x.x \
+      --wait
+    ```
+    
+    <Note>
+    Use `--reuse-values` to preserve your existing configuration. Override specific values with `--set` as needed.
+    </Note>
+  </Step>
+  
+  <Step title="Watch operator rollout">
+    ```bash
+    kubectl rollout status deployment/redis-operator -n redis-system
+    ```
+    
+    Verify leader election:
+    
+    ```bash
+    kubectl get lease redis-operator-leader -n redis-system \
+      -o jsonpath='{.spec.holderIdentity}'
+    ```
+  </Step>
+  
+  <Step title="Monitor operator logs">
+    ```bash
+    kubectl logs -n redis-system deploy/redis-operator --tail=100 -f
+    ```
+    
+    Look for successful startup and reconciliation messages.
+  </Step>
+  
+  <Step title="Watch cluster reconciliation">
+    ```bash
+    kubectl get redisclusters -A -w
+    ```
+    
+    Clusters should remain `Healthy` unless pod updates are required.
+  </Step>
+</Steps>
+
+### Post-Upgrade Validation
+
+<Steps>
+  <Step title="Verify cluster health">
+    ```bash
+    kubectl get redisclusters -A -o wide
+    ```
+    
+    Confirm all clusters show:
+    - Phase: `Healthy`
+    - Ready instances match desired instances
+    - Current primary is set
+  </Step>
+  
+  <Step title="Check for pod restarts">
+    ```bash
+    kubectl get pods -A -l redis.io/cluster -o wide
+    ```
+    
+    Compare restart counts and ages with pre-upgrade snapshot. Pods should only restart if their spec hash changed.
+  </Step>
+  
+  <Step title="Test cluster connectivity">
+    ```bash
+    kubectl run redis-test --rm -it --restart=Never \
+      --image=redis:7.2 -- redis-cli -h my-cluster-leader PING
+    ```
+    
+    Expected output: `PONG`
+  </Step>
+  
+  <Step title="Verify replication topology">
+    ```bash
+    kubectl get rediscluster my-cluster -o jsonpath='{.status.currentPrimary}'
+    kubectl get rediscluster my-cluster -o jsonpath='{.status.instancesStatus}' | jq
+    ```
+    
+    Confirm primary and replica roles are correct.
+  </Step>
+  
+  <Step title="Check events">
+    ```bash
+    kubectl get events -A --field-selector involvedObject.kind=RedisCluster \
+      --sort-by=.lastTimestamp | tail -n 50
+    ```
+    
+    Look for any warnings or errors during the upgrade window.
+  </Step>
+</Steps>
+
+## Redis Version Upgrades
+
+Upgrade Redis itself by changing the `imageName` field in your `RedisCluster` spec.
+
+### Minor Version Upgrade (e.g., 7.2.0 → 7.2.5)
+
+```bash
+kubectl patch rediscluster my-cluster --type merge \
+  -p '{"spec":{"imageName":"redis:7.2.5"}}'
+```
+
+The operator will:
+
+1. Calculate new spec hash
+2. Update replicas first (highest ordinal to lowest)
+3. Switch over primary to an updated replica
+4. Update old primary pod
+5. Return cluster to `Healthy` phase
+
+<Note>
+Minor version upgrades are typically safe and require no downtime if you have replicas.
+</Note>
+
+### Major Version Upgrade (e.g., 7.2 → 7.4)
+
+<Warning>
+Major version upgrades may have breaking changes. Always test in a non-production environment first.
+</Warning>
+
+<Steps>
+  <Step title="Review Redis release notes">
+    Check Redis changelog for breaking changes, deprecated commands, and new features.
+  </Step>
+  
+  <Step title="Create backup">
+    ```bash
+    kubectl apply -f - <<EOF
+    apiVersion: redis.io/v1
+    kind: RedisBackup
+    metadata:
+      name: pre-major-upgrade-$(date +%s)
+      namespace: default
+    spec:
+      clusterName: my-cluster
+      target: prefer-replica
+      method: rdb
+      destination:
+        s3:
+          bucket: redis-backups
+          path: major-upgrade/
+          region: us-east-1
+    EOF
+    ```
+  </Step>
+  
+  <Step title="Test in staging">
+    Clone your cluster spec, change the name and image, and deploy to a staging namespace:
+    
+    ```yaml staging-cluster.yaml
+    apiVersion: redis.io/v1
+    kind: RedisCluster
+    metadata:
+      name: my-cluster-staging
+      namespace: staging
+    spec:
+      instances: 3
+      imageName: redis:7.4  # New major version
+      storage:
+        size: 10Gi
+      # ... rest of spec
+    ```
+    
+    Verify application compatibility.
+  </Step>
+  
+  <Step title="Upgrade production cluster">
+    ```bash
+    kubectl patch rediscluster my-cluster --type merge \
+      -p '{"spec":{"imageName":"redis:7.4"}}'
+    ```
+  </Step>
+  
+  <Step title="Monitor rolling update">
+    ```bash
+    kubectl get pods -l redis.io/cluster=my-cluster -w
+    ```
+    
+    Watch as each pod is updated one at a time.
+  </Step>
+  
+  <Step title="Verify cluster health">
+    ```bash
+    kubectl get rediscluster my-cluster -o wide
+    kubectl exec my-cluster-0 -- redis-cli INFO SERVER | grep redis_version
+    ```
+  </Step>
+</Steps>
+
+## Supervised vs. Unsupervised Primary Updates
+
+Control how primary updates are handled during rolling upgrades:
+
+### Unsupervised (Default)
+
+Primary is automatically updated after all replicas:
+
+```yaml
+spec:
+  primaryUpdateStrategy: unsupervised
+```
+
+**Use when:**
+- You trust the operator to handle failover automatically
+- Downtime tolerance is low (switchover is quick)
+- You monitor via alerts but don't need manual approval
+
+### Supervised
+
+Primary update waits for manual approval:
+
+```yaml
+spec:
+  primaryUpdateStrategy: supervised
+```
+
+**Workflow:**
+
+1. Operator updates all replicas
+2. Cluster enters `WaitingForUser` phase
+3. You review cluster health and approve:
+   ```bash
+   kubectl annotate rediscluster my-cluster \
+     redis.io/approve-primary-update="$(date +%s)"
+   ```
+4. Operator performs primary switchover and update
+5. Cluster returns to `Healthy`
+
+**Use when:**
+- You want manual control over primary updates
+- Coordinating with maintenance windows
+- Extra caution for mission-critical clusters
+
+## Rollback Procedures
+
+### Rollback Operator
+
+If the new operator version has issues:
+
+```bash
+helm rollback redis-operator -n redis-system
+```
+
+This reverts to the previous Helm release.
+
+### Rollback Redis Version
+
+```bash
+kubectl patch rediscluster my-cluster --type merge \
+  -p '{"spec":{"imageName":"redis:7.2.0"}}'
+```
+
+<Warning>
+Rolling back Redis versions may not be safe if the new version wrote data in an incompatible format. Always test rollback procedures in staging.
+</Warning>
+
+## Troubleshooting Upgrades
+
+### Operator Pod CrashLooping
+
+**Cause:** CRD schema mismatch or invalid webhook configuration.
+
+**Solution:**
+
+```bash
+kubectl logs -n redis-system deploy/redis-operator --tail=100
+kubectl get validatingwebhookconfigurations redis-operator-webhook
+kubectl get mutatingwebhookconfigurations redis-operator-webhook
+```
+
+Reapply CRDs:
+
+```bash
+kubectl apply -f charts/redis-operator/crds/
+```
+
+### Cluster Stuck in Updating Phase
+
+**Cause:** Pod update blocked by PDB or scheduling constraints.
+
+**Solution:**
+
+```bash
+kubectl describe rediscluster my-cluster
+kubectl get events -n default --sort-by=.lastTimestamp | tail -n 20
+kubectl get poddisruptionbudget
+```
+
+Check for pod scheduling issues:
+
+```bash
+kubectl describe pod my-cluster-0
+```
+
+### Primary Not Updating After Replicas
+
+**Cause:** `primaryUpdateStrategy: supervised` is set and awaiting approval.
+
+**Solution:**
+
+Check cluster conditions:
+
+```bash
+kubectl get rediscluster my-cluster -o jsonpath='{.status.conditions}' | jq
+```
+
+Look for `PrimaryUpdateWaiting` condition. Approve the update:
+
+```bash
+kubectl annotate rediscluster my-cluster \
+  redis.io/approve-primary-update="approved"
+```
+
+## Best Practices
+
+- Always create backups before major upgrades
+- Test upgrades in staging environment first
+- Upgrade operator and Redis versions separately
+- Review changelogs for breaking changes
+- Monitor clusters for 24 hours post-upgrade
+- Use `supervised` primary updates for critical production clusters
+- Schedule upgrades during maintenance windows
+- Keep operator and Redis versions reasonably current (within 2-3 minor versions)

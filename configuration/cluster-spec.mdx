@@ -1,0 +1,501 @@
+---
+title: RedisClusterSpec Reference
+description: Complete reference for all RedisCluster specification fields
+---
+
+The `RedisClusterSpec` defines the desired state of a Redis replication cluster. This page documents all available fields with their types, validation rules, and default values.
+
+## Core Fields
+
+<ParamField path="instances" type="int32" required default="1">
+  Total number of Redis pods (1 primary + N-1 replicas).
+  
+  **Validation**: Minimum value is 1.
+  
+  **Example**:
+  ```yaml
+  spec:
+    instances: 3  # 1 primary + 2 replicas
+  ```
+</ParamField>
+
+<ParamField path="mode" type="ClusterMode" default="standalone">
+  Redis operating mode.
+  
+  **Allowed values**:
+  - `standalone` - Standard replication (1 primary, N replicas)
+  - `sentinel` - Automatic failover via Redis Sentinel
+  - `cluster` - Reserved for future use (currently rejected by webhook)
+  
+  **Example**:
+  ```yaml
+  spec:
+    mode: sentinel
+  ```
+</ParamField>
+
+<ParamField path="imageName" type="string" default="redis:7.2">
+  Redis container image. Compatible with Redis 7.2+ and Valkey 7.x/8.x.
+  
+  **Example**:
+  ```yaml
+  spec:
+    imageName: "redis:7.4-alpine"
+  ```
+</ParamField>
+
+<ParamField path="storage" type="StorageSpec" required>
+  PVC template for `/data` volumes. See [Storage Configuration](./storage) for details.
+  
+  **Example**:
+  ```yaml
+  spec:
+    storage:
+      size: 10Gi
+      storageClassName: fast-ssd
+  ```
+</ParamField>
+
+## Redis Configuration
+
+<ParamField path="redis" type="map[string]string">
+  Key-value pairs for `redis.conf` parameters. Applied via `CONFIG SET` on live instances.
+  
+  **Common parameters**:
+  - `maxmemory` - Maximum memory (e.g., `2gb`)
+  - `maxmemory-policy` - Eviction policy (e.g., `allkeys-lru`)
+  - `save` - RDB persistence (e.g., `900 1 300 10`)
+  - `appendonly` - Enable AOF (e.g., `yes`)
+  
+  **Example**:
+  ```yaml
+  spec:
+    redis:
+      maxmemory: "2gb"
+      maxmemory-policy: "allkeys-lru"
+      save: "900 1 300 10 60 10000"
+      appendonly: "yes"
+  ```
+</ParamField>
+
+## Resource Management
+
+<ParamField path="resources" type="ResourceRequirements">
+  CPU and memory requests/limits for Redis containers.
+  
+  **Example**:
+  ```yaml
+  spec:
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+  ```
+</ParamField>
+
+## Replication Settings
+
+<ParamField path="minSyncReplicas" type="int32" default="0">
+  Minimum number of synchronous replicas. Controls `min-replicas-to-write`.
+  
+  **Validation**: Minimum value is 0.
+  
+  **Example**:
+  ```yaml
+  spec:
+    minSyncReplicas: 1  # Primary requires 1 replica ACK before write succeeds
+  ```
+</ParamField>
+
+<ParamField path="maxSyncReplicas" type="int32" default="0">
+  Maximum number of synchronous replicas. Controls `min-replicas-max-lag`.
+  
+  **Validation**: Minimum value is 0.
+  
+  **Example**:
+  ```yaml
+  spec:
+    maxSyncReplicas: 2
+  ```
+</ParamField>
+
+## Update Strategy
+
+<ParamField path="primaryUpdateStrategy" type="PrimaryUpdateStrategy" default="unsupervised">
+  Controls whether primary replacement runs automatically or waits for approval during rolling updates.
+  
+  **Allowed values**:
+  - `unsupervised` - Primary is automatically replaced after replicas are updated
+  - `supervised` - Primary waits for manual approval via annotation
+  
+  When `supervised`, the operator sets the `PrimaryUpdateWaiting` condition to `True` and waits for the user to add the annotation:
+  ```bash
+  kubectl annotate rediscluster my-cluster redis.io/approve-primary-update=true
+  ```
+  
+  **Example**:
+  ```yaml
+  spec:
+    primaryUpdateStrategy: supervised
+  ```
+</ParamField>
+
+## High Availability
+
+<ParamField path="enablePodDisruptionBudget" type="*bool" default="true">
+  Controls whether a PodDisruptionBudget is created. The PDB ensures at least `(instances - 1)` replicas remain during voluntary disruptions.
+  
+  **Example**:
+  ```yaml
+  spec:
+    enablePodDisruptionBudget: false  # Disable PDB
+  ```
+</ParamField>
+
+<ParamField path="primaryIsolation" type="PrimaryIsolationSpec">
+  Runtime split-brain prevention for primary pods. See details below.
+  
+  <Expandable title="PrimaryIsolationSpec Fields">
+    <ParamField path="enabled" type="*bool" default="true">
+      Controls runtime primary-isolation checks in the `/healthz` endpoint.
+      
+      When enabled, the primary pod's liveness probe fails if:
+      - Kubernetes API server is unreachable
+      - Peer instance managers are unreachable
+      
+      This prevents a network-isolated primary from accepting writes.
+    </ParamField>
+    
+    <ParamField path="apiServerTimeout" type="Duration" default="5s">
+      Timeout for Kubernetes API reachability checks.
+    </ParamField>
+    
+    <ParamField path="peerTimeout" type="Duration" default="5s">
+      Timeout for peer instance-manager reachability checks.
+    </ParamField>
+  </Expandable>
+  
+  **Example**:
+  ```yaml
+  spec:
+    primaryIsolation:
+      enabled: true
+      apiServerTimeout: 3s
+      peerTimeout: 3s
+  ```
+</ParamField>
+
+## Secret References
+
+All secret fields use `LocalObjectReference` with a single `name` field. Secrets must exist in the same namespace as the RedisCluster. See [Secret Management](./secrets) for details.
+
+<ParamField path="authSecret" type="LocalObjectReference">
+  References a Secret containing the Redis password in key `password`.
+  
+  If not set, the operator auto-generates a secret named `<cluster-name>-auth`.
+  
+  **Example**:
+  ```yaml
+  spec:
+    authSecret:
+      name: my-redis-password
+  ```
+</ParamField>
+
+<ParamField path="aclConfigSecret" type="LocalObjectReference">
+  References a Secret containing ACL rules in key `acl`.
+  
+  **Example**:
+  ```yaml
+  spec:
+    aclConfigSecret:
+      name: redis-acl-rules
+  ```
+  
+  Secret contents:
+  ```yaml
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: redis-acl-rules
+  stringData:
+    acl: |
+      user admin on >adminpass ~* &* +@all
+      user readonly on >readpass ~* &* +@read
+  ```
+</ParamField>
+
+<ParamField path="tlsSecret" type="LocalObjectReference">
+  References a Secret containing `tls.crt` and `tls.key` for TLS encryption.
+  
+  **Example**:
+  ```yaml
+  spec:
+    tlsSecret:
+      name: redis-tls
+  ```
+</ParamField>
+
+<ParamField path="caSecret" type="LocalObjectReference">
+  References a Secret containing `ca.crt` for TLS client certificate verification.
+  
+  **Example**:
+  ```yaml
+  spec:
+    caSecret:
+      name: redis-ca
+  ```
+</ParamField>
+
+<ParamField path="backupCredentialsSecret" type="LocalObjectReference">
+  References a Secret containing object storage credentials for backups.
+  
+  Required keys depend on the backup destination:
+  - S3: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+  - GCS: `GOOGLE_APPLICATION_CREDENTIALS` (JSON key)
+  
+  **Example**:
+  ```yaml
+  spec:
+    backupCredentialsSecret:
+      name: s3-backup-creds
+  ```
+</ParamField>
+
+## Scheduling
+
+See [Scheduling Configuration](./scheduling) for detailed examples.
+
+<ParamField path="nodeSelector" type="map[string]string">
+  Constrains pods to nodes with matching labels.
+  
+  **Example**:
+  ```yaml
+  spec:
+    nodeSelector:
+      disktype: ssd
+      region: us-west
+  ```
+</ParamField>
+
+<ParamField path="affinity" type="Affinity">
+  Pod affinity/anti-affinity scheduling rules.
+  
+  **Example**:
+  ```yaml
+  spec:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                redis.io/cluster: my-cluster
+            topologyKey: kubernetes.io/hostname
+  ```
+</ParamField>
+
+<ParamField path="tolerations" type="[]Toleration">
+  Allow scheduling onto tainted nodes.
+  
+  **Example**:
+  ```yaml
+  spec:
+    tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "redis"
+        effect: "NoSchedule"
+  ```
+</ParamField>
+
+<ParamField path="topologySpreadConstraints" type="[]TopologySpreadConstraint">
+  Control how pods are spread across topology domains.
+  
+  **Example**:
+  ```yaml
+  spec:
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            redis.io/cluster: my-cluster
+  ```
+</ParamField>
+
+## Bootstrap and Disaster Recovery
+
+<ParamField path="bootstrap" type="BootstrapSpec">
+  Defines how to initialize the cluster from a backup. Only applied during initial cluster creation.
+  
+  <Expandable title="BootstrapSpec Fields">
+    <ParamField path="backupName" type="string" required>
+      Name of the RedisBackup resource to restore from. The backup must be in `Completed` phase.
+    </ParamField>
+  </Expandable>
+  
+  **Example**:
+  ```yaml
+  spec:
+    bootstrap:
+      backupName: prod-backup-2024-01-15
+  ```
+</ParamField>
+
+<ParamField path="replicaMode" type="ReplicaModeSpec">
+  Configures full-cluster external replication for disaster recovery. See [Replica Mode](./replica-mode) for details.
+  
+  <Expandable title="ReplicaModeSpec Fields">
+    <ParamField path="enabled" type="bool" default="false">
+      Toggles external replication mode for all data pods.
+    </ParamField>
+    
+    <ParamField path="source" type="ReplicaSourceSpec">
+      Identifies the external Redis primary to replicate from.
+      
+      <Expandable title="ReplicaSourceSpec Fields">
+        <ParamField path="host" type="string" required>
+          External Redis endpoint hostname or IP.
+        </ParamField>
+        
+        <ParamField path="port" type="int32" default="6379">
+          External Redis port.
+          
+          **Validation**: 1-65535
+        </ParamField>
+        
+        <ParamField path="clusterName" type="string">
+          Human-readable source cluster identifier for monitoring.
+        </ParamField>
+        
+        <ParamField path="authSecretName" type="string">
+          Secret name containing key `password` for upstream authentication.
+        </ParamField>
+      </Expandable>
+    </ParamField>
+    
+    <ParamField path="promote" type="bool" default="false">
+      Requests promotion of the local designated leader to standalone primary.
+      
+      Set to `true` to break replication and promote the cluster.
+    </ParamField>
+  </Expandable>
+  
+  **Example**:
+  ```yaml
+  spec:
+    replicaMode:
+      enabled: true
+      source:
+        host: primary-cluster.us-east.example.com
+        port: 6379
+        clusterName: prod-us-east
+        authSecretName: primary-cluster-auth
+  ```
+</ParamField>
+
+## Maintenance
+
+<ParamField path="nodeMaintenanceWindow" type="NodeMaintenanceWindow">
+  Controls planned node maintenance behavior.
+  
+  <Expandable title="NodeMaintenanceWindow Fields">
+    <ParamField path="inProgress" type="bool" required>
+      Indicates planned node maintenance is currently in progress.
+      
+      When `true`, the operator skips certain reconciliation steps to avoid disrupting draining nodes.
+    </ParamField>
+    
+    <ParamField path="reusePVC" type="*bool" default="true">
+      Controls whether PVCs are reused during maintenance.
+      
+      When `true`, pods recreated during maintenance reattach to existing PVCs.
+    </ParamField>
+  </Expandable>
+  
+  **Example**:
+  ```yaml
+  spec:
+    nodeMaintenanceWindow:
+      inProgress: true
+      reusePVC: true
+  ```
+</ParamField>
+
+## Complete Example
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: production-redis
+  namespace: default
+spec:
+  # Core configuration
+  instances: 5
+  mode: sentinel
+  imageName: redis:7.4-alpine
+  primaryUpdateStrategy: supervised
+  
+  # Storage
+  storage:
+    size: 50Gi
+    storageClassName: fast-ssd
+  
+  # Redis configuration
+  redis:
+    maxmemory: "8gb"
+    maxmemory-policy: "allkeys-lru"
+    save: "900 1 300 10 60 10000"
+    appendonly: "yes"
+  
+  # Resources
+  resources:
+    requests:
+      cpu: "2"
+      memory: 10Gi
+    limits:
+      cpu: "4"
+      memory: 12Gi
+  
+  # Replication
+  minSyncReplicas: 1
+  maxSyncReplicas: 2
+  
+  # Secrets
+  authSecret:
+    name: redis-password
+  aclConfigSecret:
+    name: redis-acl
+  tlsSecret:
+    name: redis-tls
+  backupCredentialsSecret:
+    name: s3-backup-creds
+  
+  # Scheduling
+  nodeSelector:
+    disktype: ssd
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: production-redis
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "redis"
+      effect: "NoSchedule"
+  
+  # High availability
+  enablePodDisruptionBudget: true
+  primaryIsolation:
+    enabled: true
+    apiServerTimeout: 5s
+    peerTimeout: 5s
+```

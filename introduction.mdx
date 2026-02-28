@@ -1,0 +1,159 @@
+---
+title: Redis Operator
+description: Production-ready Kubernetes operator for Redis clusters with automatic failover and CloudNativePG-inspired architecture
+---
+
+<img
+  className="block dark:hidden"
+  src="/images/hero-light.svg"
+  alt="Redis Operator Hero Light"
+/>
+<img
+  className="hidden dark:block"
+  src="/images/hero-dark.svg"
+  alt="Redis Operator Hero Dark"
+/>
+
+## Overview
+
+A Kubernetes operator for Redis 7.2 built around the same control-plane principles used by [CloudNativePG](https://github.com/cloudnative-pg/cloudnative-pg): direct pod/PVC management, split control/data architecture, and deterministic failover behavior.
+
+<CardGroup cols={2}>
+  <Card
+    title="Installation"
+    icon="download"
+    href="/installation"
+  >
+    Install the operator using Helm or kubectl
+  </Card>
+  <Card
+    title="Quick Start"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Deploy your first Redis cluster in minutes
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Explore RedisCluster, RedisBackup, and RedisScheduledBackup APIs
+  </Card>
+  <Card
+    title="Runbooks"
+    icon="book"
+    href="/runbooks"
+  >
+    Operational guides for failover, recovery, and maintenance
+  </Card>
+</CardGroup>
+
+## Key Features
+
+### Kubernetes-Native Cluster Management
+
+Manage Redis clusters through declarative CRDs:
+- **RedisCluster**: Full lifecycle management with automatic failover
+- **RedisBackup**: On-demand RDB/AOF backups to object storage
+- **RedisScheduledBackup**: Cron-based backup scheduling
+
+### CloudNativePG-Inspired Architecture
+
+This operator follows the same proven pattern as CloudNativePG:
+
+- **No StatefulSets**: Direct Pod and PVC management for precise lifecycle control
+- **Single binary, two roles**: Controller-manager and in-pod instance manager
+- **Instance managers**: Report per-pod status and execute operations via HTTP
+- **Authoritative control**: Controller enforces strict ordering for updates and failovers
+
+This design enables deterministic pod update ordering, explicit fencing, and controlled failover/switchover sequences instead of delegating behavior to generic controllers.
+
+### Stable Service Endpoints
+
+Each cluster exposes dedicated service endpoints:
+
+- `<name>-leader`: Current primary for write operations
+- `<name>-replica`: Read replicas for load distribution
+- `<name>-any`: All data pods for administrative tasks
+- `<name>-sentinel`: Sentinel endpoints (sentinel mode only)
+
+### Failover Safety
+
+<Note>
+The operator implements multiple layers of split-brain protection to ensure data consistency during failovers.
+</Note>
+
+- **Fencing-first failover**: Old primary is fenced before promoting a new one
+- **Boot-time split-brain guard**: Non-primary pods always start as replicas of `status.currentPrimary`
+- **Deterministic switchover**: Controlled primary replacement during rolling updates
+
+### Rolling Updates
+
+Updates follow a safe, predictable sequence:
+
+1. Replicas updated first (highest ordinal to lowest)
+2. Primary updated last with automatic switchover
+3. No StatefulSet rolling restart behavior
+
+### Secrets Management
+
+- Secrets mounted as projected volumes (never environment variables)
+- Resource version tracking in status
+- Automatic config refresh on secret rotation
+- Support for auth passwords, ACL rules, TLS certificates, and backup credentials
+
+## Supported Modes
+
+| Mode | Status | Description |
+|------|--------|-------------|
+| `standalone` | Supported | Primary + replicas with native Redis replication |
+| `sentinel` | Supported | Requires at least 3 data instances with dedicated sentinel pods |
+| `cluster` | Not Implemented | Reserved for future Redis Cluster mode support |
+
+<Warning>
+The `cluster` mode is reserved and intentionally rejected by the admission webhook. It is not currently implemented.
+</Warning>
+
+## How It Works
+
+The operator runs as a controller-manager that reconciles `RedisCluster` resources:
+
+1. **Global resources**: Creates ServiceAccount, RBAC, ConfigMap, PodDisruptionBudget
+2. **Secret resolution**: Resolves secret references and tracks resource versions
+3. **Services**: Maintains `-leader`, `-replica`, and `-any` endpoints
+4. **Status polling**: Queries each pod's instance manager via HTTP `/v1/status`
+5. **Replication topology**: Configures primary/replica relationships using `REPLICAOF`
+6. **PVC/Pod lifecycle**: Manages persistent volumes and pods directly
+
+Each Redis pod runs an instance manager as PID 1, exposing HTTP endpoints:
+- `GET /v1/status`: Reports replication state, lag, and health
+- `POST /v1/promote`: Promotes a replica to primary
+- `POST /v1/backup`: Triggers an RDB or AOF backup
+
+## Use Cases
+
+- **Application caching**: High-performance caching layer with automatic failover
+- **Session stores**: Distributed session management with persistence
+- **Message queues**: Pub/sub messaging with cluster reliability
+- **Rate limiting**: Distributed rate limiting with Redis counters
+- **Leaderboards**: Real-time leaderboards using sorted sets
+
+## Getting Started
+
+<CardGroup cols={2}>
+  <Card
+    title="Install the Operator"
+    icon="download"
+    href="/installation"
+  >
+    Install CRDs and deploy the operator using Helm
+  </Card>
+  <Card
+    title="Deploy a Cluster"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Create your first Redis cluster in under 5 minutes
+  </Card>
+</CardGroup>

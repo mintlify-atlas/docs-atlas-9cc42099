@@ -1,0 +1,595 @@
+---
+title: Scheduling Configuration
+description: NodeSelector, affinity, tolerations, and topology spread constraints
+---
+
+Redis Operator provides full control over pod scheduling through standard Kubernetes scheduling primitives.
+
+## NodeSelector
+
+Constrain pods to nodes with matching labels.
+
+<ParamField path="nodeSelector" type="map[string]string">
+  Key-value pairs that must all match node labels.
+  
+  ```yaml
+  spec:
+    nodeSelector:
+      disktype: ssd
+      region: us-west
+  ```
+</ParamField>
+
+**Example**: Schedule on SSD-backed nodes
+
+1. Label nodes:
+   ```bash
+   kubectl label nodes node-1 disktype=ssd
+   kubectl label nodes node-2 disktype=ssd
+   kubectl label nodes node-3 disktype=ssd
+   ```
+
+2. Configure cluster:
+   ```yaml
+   apiVersion: redis.io/v1
+   kind: RedisCluster
+   metadata:
+     name: my-cluster
+   spec:
+     instances: 3
+     storage:
+       size: 50Gi
+     nodeSelector:
+       disktype: ssd
+   ```
+
+3. Verify placement:
+   ```bash
+   kubectl get pods -o wide
+   # All pods should be on node-1, node-2, or node-3
+   ```
+
+## Affinity
+
+Define advanced scheduling rules for co-location or separation.
+
+<ParamField path="affinity" type="Affinity">
+  Kubernetes Affinity object with `nodeAffinity`, `podAffinity`, and `podAntiAffinity`.
+</ParamField>
+
+### Pod Anti-Affinity (High Availability)
+
+**Use case**: Ensure replicas are on different nodes/zones to survive node/zone failures.
+
+**Hard requirement** (required):
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: my-cluster
+          topologyKey: kubernetes.io/hostname
+```
+
+This ensures **no two pods from the same cluster run on the same node**.
+
+**Soft preference** (preferred):
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                redis.io/cluster: my-cluster
+            topologyKey: kubernetes.io/hostname
+```
+
+This **prefers** different nodes but allows co-location if necessary.
+
+### Zone-Level Anti-Affinity
+
+Spread across availability zones:
+
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: my-cluster
+          topologyKey: topology.kubernetes.io/zone
+```
+
+Requires:
+- At least as many zones as `spec.instances`
+- Nodes labeled with `topology.kubernetes.io/zone`
+
+### Node Affinity
+
+**Use case**: Schedule only on nodes in specific regions.
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                  - us-east-1
+                  - us-east-2
+```
+
+### Combined Affinity
+
+Node affinity + pod anti-affinity:
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                  - m5.2xlarge
+                  - m5.4xlarge
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: my-cluster
+          topologyKey: kubernetes.io/hostname
+```
+
+## Tolerations
+
+Allow scheduling onto tainted nodes.
+
+<ParamField path="tolerations" type="[]Toleration">
+  List of tolerations matching node taints.
+</ParamField>
+
+**Use case**: Dedicate nodes to Redis workloads.
+
+1. Taint nodes:
+   ```bash
+   kubectl taint nodes redis-node-1 dedicated=redis:NoSchedule
+   kubectl taint nodes redis-node-2 dedicated=redis:NoSchedule
+   kubectl taint nodes redis-node-3 dedicated=redis:NoSchedule
+   ```
+
+2. Configure cluster:
+   ```yaml
+   spec:
+     tolerations:
+       - key: "dedicated"
+         operator: "Equal"
+         value: "redis"
+         effect: "NoSchedule"
+   ```
+
+3. Result: Redis pods can schedule on tainted nodes, but other workloads cannot.
+
+### Toleration Operators
+
+**Equal** (exact match):
+```yaml
+tolerations:
+  - key: "key1"
+    operator: "Equal"
+    value: "value1"
+    effect: "NoSchedule"
+```
+
+**Exists** (tolerate any value):
+```yaml
+tolerations:
+  - key: "key1"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+**Tolerate all taints**:
+```yaml
+tolerations:
+  - operator: "Exists"  # No key specified
+```
+
+### Taint Effects
+
+- `NoSchedule`: New pods won't be scheduled (existing pods unaffected)
+- `PreferNoSchedule`: Avoid scheduling if possible
+- `NoExecute`: Evict existing pods that don't tolerate the taint
+
+**Example** (tolerate node under maintenance):
+```yaml
+tolerations:
+  - key: "node.kubernetes.io/unschedulable"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+## Topology Spread Constraints
+
+Control how pods are spread across topology domains.
+
+<ParamField path="topologySpreadConstraints" type="[]TopologySpreadConstraint">
+  Rules for distributing pods across failure domains.
+</ParamField>
+
+**Use case**: Balance pods across zones with max skew of 1.
+
+```yaml
+spec:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: my-cluster
+```
+
+**Fields**:
+- `maxSkew`: Maximum difference in pod count between any two zones
+- `topologyKey`: Node label key defining topology domains (e.g., zone, hostname)
+- `whenUnsatisfiable`: What to do if constraint can't be satisfied
+  - `DoNotSchedule`: Hard constraint (pod stays Pending)
+  - `ScheduleAnyway`: Soft constraint (try to satisfy but allow violation)
+- `labelSelector`: Which pods to consider for distribution
+
+### Multi-Level Spread
+
+Spread across zones and nodes:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+    # Zone level
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: my-cluster
+    # Node level within each zone
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway  # Soft constraint
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: my-cluster
+```
+
+**Example**: 5 instances across 3 zones
+
+| Zone | Nodes | Pods per Zone | Max Skew |
+|------|-------|---------------|----------|
+| us-east-1a | 2 | 2 | - |
+| us-east-1b | 2 | 2 | - |
+| us-east-1c | 1 | 1 | 1 (OK) |
+
+### MinDomains
+
+Ensure minimum number of domains:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      minDomains: 3  # Require at least 3 zones
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: my-cluster
+```
+
+Pods stay Pending until 3 zones are available.
+
+## Complete Examples
+
+### Production HA Setup
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: prod-redis
+spec:
+  instances: 5
+  storage:
+    size: 100Gi
+    storageClassName: fast-ssd
+  
+  # Schedule only on dedicated Redis nodes
+  nodeSelector:
+    workload: redis
+  
+  # Tolerate Redis-dedicated taints
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "redis"
+      effect: "NoSchedule"
+  
+  # Spread across zones and nodes
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                  - r5.xlarge
+                  - r5.2xlarge
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: prod-redis
+          topologyKey: kubernetes.io/hostname
+        - labelSelector:
+            matchLabels:
+              redis.io/cluster: prod-redis
+          topologyKey: topology.kubernetes.io/zone
+  
+  # Balanced distribution with hard zone constraint
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: prod-redis
+```
+
+### Cost-Optimized Setup (Spot Instances)
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: dev-redis
+spec:
+  instances: 3
+  storage:
+    size: 10Gi
+  
+  # Prefer spot instances
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: node.kubernetes.io/lifecycle
+                operator: In
+                values:
+                  - spot
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:  # Soft anti-affinity
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                redis.io/cluster: dev-redis
+            topologyKey: kubernetes.io/hostname
+  
+  # Tolerate spot instance taints
+  tolerations:
+    - key: "node.kubernetes.io/lifecycle"
+      operator: "Equal"
+      value: "spot"
+      effect: "NoSchedule"
+```
+
+### Multi-Region DR Setup
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: dr-redis-west
+  namespace: default
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  
+  # Pin to us-west region
+  nodeSelector:
+    topology.kubernetes.io/region: us-west-2
+  
+  # Spread across zones within us-west
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          redis.io/cluster: dr-redis-west
+  
+  # External replication from us-east
+  replicaMode:
+    enabled: true
+    source:
+      host: prod-redis-leader.us-east.example.com
+      port: 6379
+      clusterName: prod-redis-east
+      authSecretName: east-cluster-auth
+```
+
+## Best Practices
+
+### Always use pod anti-affinity for HA clusters
+
+**Minimum**: Node-level anti-affinity
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            redis.io/cluster: my-cluster
+        topologyKey: kubernetes.io/hostname
+```
+
+**Recommended**: Zone-level for multi-AZ clusters
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            redis.io/cluster: my-cluster
+        topologyKey: topology.kubernetes.io/zone
+```
+
+### Dedicate nodes for production Redis
+
+1. Create node pool:
+   ```bash
+   # Example: GKE
+   gcloud container node-pools create redis-pool \
+     --cluster=my-cluster \
+     --machine-type=n2-standard-8 \
+     --num-nodes=3 \
+     --node-taints=dedicated=redis:NoSchedule \
+     --node-labels=workload=redis
+   ```
+
+2. Configure cluster:
+   ```yaml
+   spec:
+     nodeSelector:
+       workload: redis
+     tolerations:
+       - key: "dedicated"
+         operator: "Equal"
+         value: "redis"
+         effect: "NoSchedule"
+   ```
+
+### Use topology spread for large clusters
+
+Instead of just anti-affinity, use topology spread constraints for balanced distribution:
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        redis.io/cluster: my-cluster
+```
+
+This ensures even distribution as you scale beyond 3 zones.
+
+### Test scheduling constraints before production
+
+Dry-run to verify pod placement:
+
+```bash
+# Create cluster
+kubectl apply -f rediscluster.yaml
+
+# Check pod distribution
+kubectl get pods -o wide -l redis.io/cluster=my-cluster
+
+# Verify zone spread
+kubectl get pods -l redis.io/cluster=my-cluster \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}' | \
+  while read pod node; do
+    zone=$(kubectl get node $node -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}')
+    echo "$pod -> $node -> $zone"
+  done
+```
+
+## Troubleshooting
+
+### Pods stuck in Pending
+
+**Symptom**:
+```bash
+$ kubectl get pods
+NAME           READY   STATUS    RESTARTS   AGE
+my-cluster-0   0/1     Pending   0          5m
+```
+
+**Diagnosis**:
+```bash
+kubectl describe pod my-cluster-0
+# Look for events:
+#   0/3 nodes are available: 3 node(s) didn't match pod anti-affinity rules.
+```
+
+**Causes**:
+1. **Insufficient nodes**: Anti-affinity requires N nodes for N pods
+2. **Taint mismatch**: Pods don't tolerate node taints
+3. **Resource constraints**: Nodes lack CPU/memory
+4. **Zone constraints**: Not enough zones for topology spread
+
+**Solutions**:
+- Add more nodes: `kubectl scale nodepool --num-nodes=5`
+- Relax anti-affinity from `required` to `preferred`
+- Check node taints: `kubectl describe nodes | grep Taints`
+
+### Uneven pod distribution
+
+**Symptom**: 3 pods in zone A, 1 pod in zone B, 1 pod in zone C
+
+**Cause**: Using `preferredDuringSchedulingIgnoredDuringExecution` (soft constraint)
+
+**Fix**: Use `requiredDuringSchedulingIgnoredDuringExecution` (hard constraint)
+
+```yaml
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:  # Changed from preferred
+      - labelSelector:
+          matchLabels:
+            redis.io/cluster: my-cluster
+        topologyKey: topology.kubernetes.io/zone
+```
+
+Then trigger rolling update:
+```bash
+kubectl annotate rediscluster my-cluster force-update="$(date)"
+```
+
+### Label selector not matching
+
+**Symptom**: Topology spread constraint not working
+
+**Cause**: `labelSelector` doesn't match pod labels
+
+**Debug**:
+```bash
+# Check pod labels
+kubectl get pods -l redis.io/cluster=my-cluster --show-labels
+
+# Verify label selector
+kubectl get pods -l redis.io/cluster=my-cluster,redis.io/role=primary
+```
+
+**Fix**: Use correct labels in topology spread:
+```yaml
+topologySpreadConstraints:
+  - labelSelector:
+      matchLabels:
+        redis.io/cluster: my-cluster  # Must match actual pod labels
+```

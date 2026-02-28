@@ -1,0 +1,435 @@
+---
+title: Backup and Restore
+description: Backup workflows, scheduling, and restore procedures
+---
+
+The Redis Operator provides two CRDs for backup management: `RedisBackup` for on-demand backups and `RedisScheduledBackup` for automated backup schedules.
+
+## Backup Methods
+
+Two backup methods are supported:
+
+### RDB (Redis Database)
+
+Point-in-time snapshot of the entire dataset. Recommended for most use cases.
+
+- **Format:** Binary RDB file
+- **Size:** Compact, compressed
+- **Speed:** Fast for restore
+- **Consistency:** Atomic snapshot
+
+### AOF (Append-Only File)
+
+Log of all write operations. Useful for audit trails or granular recovery.
+
+- **Format:** Text-based command log archive
+- **Size:** Larger than RDB
+- **Speed:** Slower restore (replays commands)
+- **Consistency:** Per-operation durability
+
+## On-Demand Backups
+
+Create a `RedisBackup` resource to trigger an immediate backup.
+
+### Basic Backup
+
+```yaml backup.yaml
+apiVersion: redis.io/v1
+kind: RedisBackup
+metadata:
+  name: my-cluster-backup-001
+  namespace: default
+spec:
+  clusterName: my-cluster
+  target: prefer-replica
+  method: rdb
+  destination:
+    s3:
+      bucket: redis-backups
+      path: production/my-cluster
+      region: us-east-1
+```
+
+<Steps>
+  <Step title="Create the backup">
+    ```bash
+    kubectl apply -f backup.yaml
+    ```
+  </Step>
+  
+  <Step title="Monitor progress">
+    ```bash
+    kubectl get redisbackup my-cluster-backup-001 -o wide
+    ```
+    
+    Expected phases: `Pending` → `Running` → `Completed`
+  </Step>
+  
+  <Step title="Check backup details">
+    ```bash
+    kubectl get redisbackup my-cluster-backup-001 -o yaml
+    ```
+    
+    Inspect `status.backupPath`, `status.backupSize`, and `status.completedAt`.
+  </Step>
+</Steps>
+
+### Backup Targets
+
+The `target` field controls which pod executes the backup:
+
+- `prefer-replica` (default) - Prefer a replica to avoid impact on primary
+- `primary` - Always run on the primary pod
+
+<Note>
+Backups always run on a single pod. The operator selects an available replica if `prefer-replica` is set, falling back to primary if no replicas are available.
+</Note>
+
+### S3-Compatible Storage
+
+Backups are stored in S3-compatible object storage. Configure credentials via a Secret:
+
+```yaml backup-credentials.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-credentials
+  namespace: default
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+  AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+Reference the secret in your `RedisCluster` spec:
+
+```yaml cluster.yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: my-cluster
+spec:
+  instances: 3
+  backupCredentialsSecret:
+    name: backup-credentials
+  # ... other fields
+```
+
+<Warning>
+Never commit backup credentials to version control. Use sealed secrets, external secrets operator, or cloud-native secret management.
+</Warning>
+
+## Scheduled Backups
+
+Automate backups with `RedisScheduledBackup` using cron expressions.
+
+### Daily Backup Schedule
+
+```yaml scheduled-backup.yaml
+apiVersion: redis.io/v1
+kind: RedisScheduledBackup
+metadata:
+  name: my-cluster-daily
+  namespace: default
+spec:
+  clusterName: my-cluster
+  schedule: "0 2 * * *"  # 2 AM daily
+  target: prefer-replica
+  method: rdb
+  destination:
+    s3:
+      bucket: redis-backups
+      path: production/my-cluster
+      region: us-east-1
+  successfulBackupsHistoryLimit: 7
+  failedBackupsHistoryLimit: 3
+```
+
+### Schedule Syntax
+
+Use standard cron format:
+
+```
+┌───────────── minute (0 - 59)
+│ ┌───────────── hour (0 - 23)
+│ │ ┌───────────── day of month (1 - 31)
+│ │ │ ┌───────────── month (1 - 12)
+│ │ │ │ ┌───────────── day of week (0 - 6) (Sunday to Saturday)
+│ │ │ │ │
+* * * * *
+```
+
+**Examples:**
+
+- `0 2 * * *` - Daily at 2 AM
+- `0 */6 * * *` - Every 6 hours
+- `0 0 * * 0` - Weekly on Sunday at midnight
+- `0 0 1 * *` - Monthly on the 1st at midnight
+
+### History Limits
+
+Control backup retention with history limits:
+
+```yaml
+successfulBackupsHistoryLimit: 7   # Keep last 7 successful backups
+failedBackupsHistoryLimit: 3       # Keep last 3 failed backups
+```
+
+Older backups are automatically deleted by the operator. Object storage artifacts are **not** automatically cleaned up.
+
+<Note>
+The operator only deletes `RedisBackup` CRs, not the backup files in object storage. Implement lifecycle policies in your S3 bucket for automatic cleanup.
+</Note>
+
+### Suspend Scheduled Backups
+
+Temporarily pause scheduled backups:
+
+```bash
+kubectl patch redisscheduledbackup my-cluster-daily \
+  --type merge \
+  -p '{"spec":{"suspend":true}}'
+```
+
+Resume:
+
+```bash
+kubectl patch redisscheduledbackup my-cluster-daily \
+  --type merge \
+  -p '{"spec":{"suspend":false}}'
+```
+
+## Monitoring Backups
+
+### List All Backups
+
+```bash
+kubectl get redisbackups -n default
+```
+
+### Check Backup Status
+
+```bash
+kubectl describe redisbackup my-cluster-backup-001
+```
+
+Look for events indicating backup start, progress, and completion.
+
+### Metrics
+
+The operator exposes backup metrics:
+
+- `redis_last_successful_backup_timestamp{cluster="my-cluster"}` - Timestamp of last successful backup
+- `redis_backup_phase_count{phase="Completed"}` - Count of completed backups
+- `redis_backup_phase_count{phase="Failed"}` - Count of failed backups
+
+### Alerts
+
+The default `PrometheusRule` includes a `RedisBackupMissing` alert that fires when no successful backup has completed within 24 hours (configurable).
+
+## Restore from Backup
+
+Restore a cluster from a backup using the `bootstrap` field.
+
+<Warning>
+Restore only works during cluster creation. You cannot restore into an existing cluster with data.
+</Warning>
+
+### Create Cluster from Backup
+
+```yaml restore-cluster.yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: my-cluster-restored
+  namespace: default
+spec:
+  instances: 3
+  imageName: redis:7.2
+  storage:
+    size: 10Gi
+  backupCredentialsSecret:
+    name: backup-credentials
+  bootstrap:
+    backupName: my-cluster-backup-001
+```
+
+<Steps>
+  <Step title="Verify backup exists">
+    ```bash
+    kubectl get redisbackup my-cluster-backup-001 -o yaml
+    ```
+    
+    Confirm `status.phase` is `Completed` and `status.backupPath` is set.
+  </Step>
+  
+  <Step title="Create the cluster">
+    ```bash
+    kubectl apply -f restore-cluster.yaml
+    ```
+  </Step>
+  
+  <Step title="Monitor restore progress">
+    ```bash
+    kubectl get rediscluster my-cluster-restored -o wide -w
+    ```
+    
+    Wait for phase to reach `Healthy`.
+  </Step>
+  
+  <Step title="Verify data">
+    Connect to the restored cluster and verify data integrity:
+    
+    ```bash
+    kubectl exec -it my-cluster-restored-0 -- redis-cli
+    > DBSIZE
+    > GET sample-key
+    ```
+  </Step>
+</Steps>
+
+## Backup Workflow Details
+
+Understanding the internal backup process:
+
+<Steps>
+  <Step title="Cluster validation">
+    Operator verifies the target cluster exists and is in `Healthy` phase.
+  </Step>
+  
+  <Step title="Pod selection">
+    Based on `target` field, operator selects a replica (if available) or primary pod.
+  </Step>
+  
+  <Step title="Backup trigger">
+    Operator sends `POST /v1/backup` to the instance manager on the target pod at `internal/controller/backup/executor.go:26`.
+  </Step>
+  
+  <Step title="RDB/AOF generation">
+    Instance manager executes:
+    - **RDB:** Triggers `BGSAVE` or copies latest dump.rdb
+    - **AOF:** Packages AOF files into an archive
+  </Step>
+  
+  <Step title="Upload to S3">
+    Instance manager uploads the backup artifact to the configured S3 destination.
+  </Step>
+  
+  <Step title="Status update">
+    Operator updates `RedisBackup` status with:
+    - `backupPath` - S3 key/path
+    - `backupSize` - Size in bytes
+    - `artifactType` - `rdb` or `aof-archive`
+    - `completedAt` - Completion timestamp
+  </Step>
+</Steps>
+
+## Best Practices
+
+### Backup Timing
+
+- Schedule backups during low-traffic periods (e.g., 2-4 AM)
+- Use `prefer-replica` to avoid primary impact
+- Avoid overlapping backup windows
+
+### Retention Strategy
+
+- **Production:** 7+ daily backups, 4+ weekly backups, 12 monthly backups
+- **Staging:** 3-7 daily backups
+- **Development:** 1-3 daily backups
+
+### Disaster Recovery
+
+- Store backups in a different region than the cluster
+- Test restore procedures quarterly
+- Document RPO (Recovery Point Objective) and RTO (Recovery Time Objective)
+- Keep at least one off-cluster backup for catastrophic failures
+
+### S3 Bucket Configuration
+
+```json lifecycle-policy.json
+{
+  "Rules": [
+    {
+      "Id": "ExpireOldBackups",
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 30
+      },
+      "Filter": {
+        "Prefix": "production/"
+      }
+    },
+    {
+      "Id": "TransitionToGlacier",
+      "Status": "Enabled",
+      "Transitions": [
+        {
+          "Days": 7,
+          "StorageClass": "GLACIER"
+        }
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+Enable S3 versioning and cross-region replication for production backups.
+</Note>
+
+## Troubleshooting
+
+### Backup Stuck in Pending
+
+**Cause:** Cluster not in `Healthy` phase.
+
+**Solution:** Check cluster status and resolve any issues:
+
+```bash
+kubectl get rediscluster my-cluster -o jsonpath='{.status.phase}'
+kubectl describe rediscluster my-cluster
+```
+
+### Backup Failed with S3 Error
+
+**Cause:** Invalid credentials or bucket permissions.
+
+**Solution:** Verify credentials and IAM policy:
+
+```bash
+kubectl get secret backup-credentials -o yaml
+```
+
+Required IAM permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::redis-backups/*",
+        "arn:aws:s3:::redis-backups"
+      ]
+    }
+  ]
+}
+```
+
+### Restore Not Working
+
+**Cause:** Restore can only run on a new cluster, not existing clusters.
+
+**Solution:** Delete the existing cluster first or create a new cluster with a different name:
+
+```bash
+kubectl delete rediscluster my-cluster
+kubectl apply -f restore-cluster.yaml
+```

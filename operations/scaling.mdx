@@ -1,0 +1,334 @@
+---
+title: Scaling
+description: Scale Redis clusters up and down
+---
+
+Scale Redis replication clusters by changing the `instances` field in your `RedisCluster` spec.
+
+## Scaling Up (Adding Replicas)
+
+Increase the number of instances to add replicas.
+
+### Scale from 3 to 5 Instances
+
+```bash
+kubectl patch rediscluster my-cluster --type merge \
+  -p '{"spec":{"instances":5}}'
+```
+
+### What Happens
+
+<Steps>
+  <Step title="Reconciler detects change">
+    Operator compares desired instances (5) with current instances (3).
+  </Step>
+  
+  <Step title="Cluster phase changes">
+    Status phase transitions from `Healthy` to `Scaling`.
+  </Step>
+  
+  <Step title="PVCs created">
+    Operator creates PVCs for new pods: `data-my-cluster-3`, `data-my-cluster-4`.
+  </Step>
+  
+  <Step title="Pods created">
+    New pods `my-cluster-3` and `my-cluster-4` are created with `REPLICAOF` configuration pointing to the current primary.
+  </Step>
+  
+  <Step title="Replication sync">
+    New replicas perform full sync with the primary, pulling all data.
+  </Step>
+  
+  <Step title="Cluster returns to Healthy">
+    Once new replicas are in sync, cluster phase returns to `Healthy`.
+  </Step>
+</Steps>
+
+### Monitor Scaling Progress
+
+```bash
+# Watch cluster status
+kubectl get rediscluster my-cluster -o wide -w
+
+# Watch pods
+kubectl get pods -l redis.io/cluster=my-cluster -w
+
+# Check replication status
+kubectl exec my-cluster-0 -- redis-cli INFO replication
+```
+
+### Performance Impact
+
+Adding replicas causes:
+
+- **Network I/O spike** - Full sync transfers entire dataset from primary to new replicas
+- **Disk I/O increase** - Primary generates RDB snapshot for each new replica
+- **CPU usage** - RDB generation and transfer processing
+
+<Note>
+For large datasets (>10 GB), scale up during low-traffic periods. Full sync can take several minutes to hours depending on dataset size and network bandwidth.
+</Note>
+
+## Scaling Down (Removing Replicas)
+
+Decrease the number of instances to remove replicas.
+
+<Warning>
+Scaling down deletes pods and their PVCs. Ensure you have backups before reducing instance count.
+</Warning>
+
+### Scale from 5 to 3 Instances
+
+```bash
+kubectl patch rediscluster my-cluster --type merge \
+  -p '{"spec":{"instances":3}}'
+```
+
+### What Happens
+
+<Steps>
+  <Step title="Reconciler detects change">
+    Operator compares desired instances (3) with current instances (5).
+  </Step>
+  
+  <Step title="Cluster phase changes">
+    Status phase transitions from `Healthy` to `Scaling`.
+  </Step>
+  
+  <Step title="Replica selection">
+    Operator selects replicas to delete (highest ordinals first): `my-cluster-4`, `my-cluster-3`.
+  </Step>
+  
+  <Step title="Primary protection">
+    If the current primary is in the deletion set, operator performs a switchover to a remaining replica first.
+  </Step>
+  
+  <Step title="Pods deleted">
+    Selected pods are deleted gracefully (30s grace period by default).
+  </Step>
+  
+  <Step title="PVCs deleted">
+    PVCs for deleted pods are removed (configurable via deletion policy).
+  </Step>
+  
+  <Step title="Cluster returns to Healthy">
+    Once all deletions complete, cluster phase returns to `Healthy`.
+  </Step>
+</Steps>
+
+<Warning>
+**Never scale down to 0 instances.** The minimum is 1 instance (standalone mode). The operator webhook rejects `instances: 0`.
+</Warning>
+
+### PVC Retention on Scale Down
+
+By default, PVCs are deleted when scaling down. To preserve PVCs:
+
+```yaml
+spec:
+  storage:
+    size: 10Gi
+    storageClassName: my-storage-class
+    # Note: PVC retention is controlled by StorageClass reclaimPolicy
+```
+
+Set your StorageClass `reclaimPolicy` to `Retain`:
+
+```yaml storageclass.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: my-storage-class
+provisioner: kubernetes.io/aws-ebs
+reclaimPolicy: Retain  # Keeps PVs after PVC deletion
+```
+
+## Scaling to 1 Instance (Standalone)
+
+You can scale down to a single instance:
+
+```bash
+kubectl patch rediscluster my-cluster --type merge \
+  -p '{"spec":{"instances":1}}'
+```
+
+This removes all replicas, leaving only the primary pod in standalone mode.
+
+<Warning>
+A single-instance cluster has **no redundancy**. If the pod fails, data is lost unless you have backups. Not recommended for production.
+</Warning>
+
+## Scaling Sentinel Mode Clusters
+
+For clusters using `mode: sentinel`, sentinel pods are managed separately:
+
+```yaml
+spec:
+  mode: sentinel
+  instances: 5  # Data pods (1 primary + 4 replicas)
+  # Sentinel pods are always 3 instances by default
+```
+
+Sentinel instances are fixed at 3 and cannot be scaled independently in the current implementation.
+
+<Note>
+Scaling the `instances` field only affects Redis data pods, not sentinel pods at `internal/controller/cluster/sentinel.go:85`.
+</Note>
+
+## Capacity Planning
+
+### When to Scale Up
+
+- **High read load** - Add replicas to distribute read traffic
+- **Replication lag increasing** - More replicas means more replication load on primary; consider scaling primary resources instead
+- **Disaster recovery** - More replicas improve availability during node failures
+- **Geographic distribution** - Place replicas in multiple zones/regions
+
+### When to Scale Down
+
+- **Over-provisioned** - Reduce cost by removing unused replicas
+- **Low traffic periods** - Scale down during off-peak hours (if data loss risk is acceptable)
+- **Testing/development** - Non-critical environments don't need high replica counts
+
+### Recommended Instance Counts
+
+| Environment | Instances | Notes |
+|------------|-----------|-------|
+| Development | 1-2 | Cost-effective, minimal redundancy |
+| Staging | 2-3 | Mirrors production for testing |
+| Production | 3-5 | High availability, read scaling |
+| Mission-critical | 5+ | Maximum redundancy |
+
+<Note>
+More replicas increase operational cost (compute, storage, network) and replication overhead on the primary. Find the balance between availability and cost.
+</Note>
+
+## Automatic Scaling
+
+The operator does not include built-in HPA (Horizontal Pod Autoscaler) support for Redis clusters.
+
+### Why HPA is Not Supported
+
+- **Stateful nature** - Scaling Redis requires data replication, not just pod creation
+- **Primary constraints** - Only one primary pod can accept writes
+- **Replication lag** - Adding replicas causes load on primary, not relief
+- **PVC management** - Automatic PVC creation/deletion requires careful orchestration
+
+### Workarounds for Auto-Scaling
+
+Implement custom controllers that:
+
+1. Monitor metrics (CPU, memory, `redis_connected_clients`)
+2. Patch `RedisCluster` spec when thresholds are exceeded
+3. Trigger scale-up during high load
+4. Scale down during low load with hysteresis to prevent flapping
+
+**Example: Custom scaling script**
+
+```bash scale-up.sh
+#!/bin/bash
+# Scale up if connected clients > 1000
+
+CLUSTER_NAME="my-cluster"
+NAMESPACE="default"
+
+CLIENTS=$(kubectl exec ${CLUSTER_NAME}-0 -n ${NAMESPACE} -- \
+  redis-cli INFO clients | grep connected_clients | cut -d: -f2 | tr -d '\r')
+
+if [ "$CLIENTS" -gt 1000 ]; then
+  CURRENT=$(kubectl get rediscluster ${CLUSTER_NAME} -n ${NAMESPACE} \
+    -o jsonpath='{.spec.instances}')
+  NEW=$((CURRENT + 1))
+  
+  echo "Scaling up from ${CURRENT} to ${NEW} instances"
+  kubectl patch rediscluster ${CLUSTER_NAME} -n ${NAMESPACE} \
+    --type merge -p "{\"spec\":{\"instances\":${NEW}}}"
+fi
+```
+
+Schedule this script with a CronJob or run it in a custom controller.
+
+<Warning>
+Automatic scaling of stateful systems is complex. Test thoroughly before using in production.
+</Warning>
+
+## Vertical Scaling (Resource Limits)
+
+Scale compute resources (CPU, memory) by updating the `resources` field:
+
+```bash
+kubectl patch rediscluster my-cluster --type merge -p '{
+  "spec": {
+    "resources": {
+      "requests": {
+        "cpu": "2000m",
+        "memory": "4Gi"
+      },
+      "limits": {
+        "cpu": "4000m",
+        "memory": "8Gi"
+      }
+    }
+  }
+}'
+```
+
+This triggers a rolling update of all pods at `internal/controller/cluster/rolling_update.go:23`.
+
+<Note>
+Vertical scaling requires pod restarts. The operator performs rolling updates (replicas first, then primary) to maintain availability.
+</Note>
+
+## Storage Scaling (PVC Resize)
+
+Increase storage size by updating the `storage.size` field:
+
+```bash
+kubectl patch rediscluster my-cluster --type merge -p '{
+  "spec": {
+    "storage": {
+      "size": "20Gi"
+    }
+  }
+}'
+```
+
+### Requirements
+
+- StorageClass must support volume expansion (`allowVolumeExpansion: true`)
+- Underlying storage driver must support online resize
+- New size must be larger than current size (shrinking is not supported)
+
+### What Happens
+
+<Steps>
+  <Step title="PVC resize triggered">
+    Operator patches PVCs with new size: `kubectl patch pvc data-my-cluster-0 -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'`
+  </Step>
+  
+  <Step title="Volume expansion">
+    Kubernetes and storage driver expand the underlying volume. This may take several minutes depending on the storage backend.
+  </Step>
+  
+  <Step title="Filesystem resize">
+    For some storage types, pods may need to restart to resize the filesystem. The operator handles this automatically.
+  </Step>
+  
+  <Step title="Cluster returns to Healthy">
+    Once all PVCs are resized, cluster phase returns to `Healthy`.
+  </Step>
+</Steps>
+
+<Warning>
+**Shrinking storage is not supported** by Kubernetes. You cannot reduce PVC size. If you need to shrink, you must create a new cluster with smaller storage and migrate data.
+</Warning>
+
+## Best Practices
+
+- **Scale gradually** - Add 1-2 replicas at a time, wait for sync to complete
+- **Monitor during scaling** - Watch replication lag, network I/O, and primary CPU
+- **Backup before scaling down** - Always create backups before removing instances
+- **Test scaling in staging** - Verify scaling behavior matches expectations
+- **Use PDB** - Keep `enablePodDisruptionBudget: true` to protect availability during scaling
+- **Plan for growth** - Provision storage with headroom for future expansion
+- **Avoid scale-down during high load** - Only scale down during low-traffic periods

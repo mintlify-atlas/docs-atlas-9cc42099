@@ -1,0 +1,398 @@
+---
+title: Maintenance Windows
+description: Planned maintenance and node maintenance workflows
+---
+
+The Redis Operator provides mechanisms for handling planned maintenance, including node maintenance windows and controlled cluster updates.
+
+## Node Maintenance Mode
+
+When performing planned node maintenance (kernel upgrades, hardware replacement, etc.), use the `nodeMaintenanceWindow` feature to control how Redis pods behave during node drains.
+
+### Enabling Maintenance Mode
+
+Set `nodeMaintenanceWindow.inProgress` to `true` in your cluster spec:
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: my-cluster
+spec:
+  instances: 3
+  nodeMaintenanceWindow:
+    inProgress: true
+    reusePVC: true
+  # ... other fields
+```
+
+Or patch an existing cluster:
+
+```bash
+kubectl patch rediscluster my-cluster --type merge -p '{
+  "spec": {
+    "nodeMaintenanceWindow": {
+      "inProgress": true,
+      "reusePVC": true
+    }
+  }
+}'
+```
+
+### How It Works
+
+When maintenance mode is enabled:
+
+1. **PVC Reuse** - If `reusePVC: true` (default), PVCs remain attached even when pods are evicted. This preserves data and speeds up pod rescheduling on other nodes.
+
+2. **Graceful Draining** - The operator detects pod evictions and allows Kubernetes to reschedule pods while maintaining cluster availability.
+
+3. **Replication Awareness** - Primary pods are moved via controlled switchover before node drain completes.
+
+4. **Status Tracking** - Cluster status condition `MaintenanceInProgress` is set to `True`.
+
+<Note>
+Maintenance mode does **not** prevent pods from being evicted. It changes how the operator responds to evictions during the maintenance window.
+</Note>
+
+## Maintenance Workflow
+
+<Steps>
+  <Step title="Enable maintenance mode">
+    ```bash
+    kubectl patch rediscluster my-cluster --type merge -p '{
+      "spec": {
+        "nodeMaintenanceWindow": {
+          "inProgress": true
+        }
+      }
+    }'
+    ```
+    
+    Verify the condition:
+    
+    ```bash
+    kubectl get rediscluster my-cluster \
+      -o jsonpath='{.status.conditions[?(@.type=="MaintenanceInProgress")]}' | jq
+    ```
+  </Step>
+  
+  <Step title="Cordon node(s)">
+    ```bash
+    kubectl cordon node-1
+    ```
+    
+    This prevents new pods from scheduling on the node.
+  </Step>
+  
+  <Step title="Drain node(s)">
+    ```bash
+    kubectl drain node-1 \
+      --ignore-daemonsets \
+      --delete-emptydir-data \
+      --grace-period=30
+    ```
+    
+    Pods are gracefully evicted and rescheduled on other nodes.
+  </Step>
+  
+  <Step title="Monitor pod rescheduling">
+    ```bash
+    kubectl get pods -l redis.io/cluster=my-cluster -o wide -w
+    ```
+    
+    Watch as pods are recreated on available nodes.
+  </Step>
+  
+  <Step title="Perform node maintenance">
+    Complete your maintenance tasks (kernel upgrade, hardware replacement, etc.).
+  </Step>
+  
+  <Step title="Uncordon node(s)">
+    ```bash
+    kubectl uncordon node-1
+    ```
+    
+    Node is now available for scheduling again.
+  </Step>
+  
+  <Step title="Disable maintenance mode">
+    ```bash
+    kubectl patch rediscluster my-cluster --type merge -p '{
+      "spec": {
+        "nodeMaintenanceWindow": {
+          "inProgress": false
+        }
+      }
+    }'
+    ```
+    
+    Cluster returns to normal operation.
+  </Step>
+</Steps>
+
+## PVC Reuse Behavior
+
+The `reusePVC` field controls PVC handling during maintenance:
+
+### reusePVC: true (Default)
+
+**Behavior:**
+- PVCs remain bound to their original nodes
+- When pods reschedule to different nodes, they detach and reattach PVCs
+- Data is preserved across node moves
+- Faster recovery (no data copy required)
+
+**Use when:**
+- Using cloud storage (EBS, PD, Azure Disk) that supports cross-node attachment
+- Nodes are in the same availability zone
+- You want zero data loss during maintenance
+
+### reusePVC: false
+
+**Behavior:**
+- PVCs are deleted when pods are evicted
+- New PVCs are created when pods reschedule
+- Data is lost unless you have backups
+
+**Use when:**
+- Using local storage that cannot move between nodes
+- You want a clean slate after maintenance
+- Data is ephemeral or can be restored from backup
+
+<Warning>
+Setting `reusePVC: false` causes data loss. Create backups before enabling maintenance mode if you need to preserve data.
+</Warning>
+
+## Multi-Node Maintenance
+
+When maintaining multiple nodes simultaneously:
+
+### Sequential Maintenance (Recommended)
+
+Drain nodes one at a time:
+
+```bash
+# Node 1
+kubectl drain node-1 --ignore-daemonsets --grace-period=30
+# Wait for pods to reschedule and cluster to return to Healthy
+kubectl get rediscluster my-cluster -o jsonpath='{.status.phase}'
+
+# Node 2 (only after node-1 is done)
+kubectl drain node-2 --ignore-daemonsets --grace-period=30
+# Wait for Healthy...
+
+# Node 3
+kubectl drain node-3 --ignore-daemonsets --grace-period=30
+```
+
+**Advantages:**
+- Maintains cluster availability
+- Replicas remain available during drain
+- Lower risk of data loss
+
+### Parallel Maintenance (Advanced)
+
+Drain multiple nodes simultaneously:
+
+```bash
+kubectl drain node-1 node-2 --ignore-daemonsets --grace-period=30
+```
+
+<Warning>
+Parallel draining can cause temporary unavailability if the primary and all replicas are on affected nodes. Only use for clusters with sufficient node distribution.
+</Warning>
+
+**Requirements:**
+- At least N+2 nodes for N replicas
+- Pod anti-affinity configured to spread pods across nodes
+- PodDisruptionBudget properly configured
+
+## PodDisruptionBudget Integration
+
+The operator creates a PodDisruptionBudget (PDB) by default to protect cluster availability during voluntary disruptions:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-cluster
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      redis.io/cluster: my-cluster
+      redis.io/workload: data
+```
+
+### Disable PDB (Not Recommended)
+
+To allow faster draining at the cost of availability:
+
+```yaml
+spec:
+  enablePodDisruptionBudget: false
+```
+
+<Warning>
+Disabling PDB allows multiple pods to be evicted simultaneously, potentially causing cluster downtime.
+</Warning>
+
+## Maintenance Best Practices
+
+### Pre-Maintenance Checklist
+
+<Steps>
+  <Step title="Create backups">
+    ```bash
+    kubectl apply -f - <<EOF
+    apiVersion: redis.io/v1
+    kind: RedisBackup
+    metadata:
+      name: pre-maintenance-$(date +%s)
+    spec:
+      clusterName: my-cluster
+      target: prefer-replica
+      method: rdb
+      destination:
+        s3:
+          bucket: redis-backups
+          path: maintenance/
+          region: us-east-1
+    EOF
+    ```
+  </Step>
+  
+  <Step title="Verify cluster health">
+    ```bash
+    kubectl get rediscluster my-cluster -o wide
+    ```
+    
+    Ensure phase is `Healthy` and all replicas are ready.
+  </Step>
+  
+  <Step title="Check node distribution">
+    ```bash
+    kubectl get pods -l redis.io/cluster=my-cluster -o wide
+    ```
+    
+    Confirm pods are spread across multiple nodes.
+  </Step>
+  
+  <Step title="Review PDB status">
+    ```bash
+    kubectl get pdb my-cluster -o yaml
+    ```
+    
+    Verify `disruptionsAllowed` is at least 1.
+  </Step>
+</Steps>
+
+### During Maintenance
+
+- Monitor cluster phase: `kubectl get rediscluster my-cluster -o jsonpath='{.status.phase}' -w`
+- Watch pod events: `kubectl get events -n default --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp`
+- Check replication lag: Observe `redis_replication_lag_bytes` metric in Grafana
+- Validate primary location: Ensure primary is not on a node being drained
+
+### Post-Maintenance
+
+<Steps>
+  <Step title="Disable maintenance mode">
+    ```bash
+    kubectl patch rediscluster my-cluster --type merge -p '{
+      "spec": {
+        "nodeMaintenanceWindow": {
+          "inProgress": false
+        }
+      }
+    }'
+    ```
+  </Step>
+  
+  <Step title="Verify cluster health">
+    ```bash
+    kubectl get rediscluster my-cluster -o wide
+    kubectl exec my-cluster-0 -- redis-cli INFO replication
+    ```
+  </Step>
+  
+  <Step title="Check pod distribution">
+    ```bash
+    kubectl get pods -l redis.io/cluster=my-cluster -o wide
+    ```
+    
+    Pods may have moved to different nodes.
+  </Step>
+  
+  <Step title="Review events and metrics">
+    ```bash
+    kubectl get events -n default --sort-by=.lastTimestamp | tail -n 50
+    ```
+    
+    Look for any warnings or errors.
+  </Step>
+</Steps>
+
+## Handling Stuck Drains
+
+### Pod Won't Evict
+
+**Cause:** PDB blocking eviction or pod finalizers.
+
+**Solution:**
+
+```bash
+# Check PDB status
+kubectl get pdb my-cluster -o yaml
+
+# Check pod for finalizers
+kubectl get pod my-cluster-0 -o yaml | grep -A5 finalizers
+
+# Force drain (use with caution)
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data --force
+```
+
+### PVC Not Detaching
+
+**Cause:** Volume still attached to old node.
+
+**Solution:**
+
+```bash
+# Check volume attachment
+kubectl get volumeattachment | grep my-cluster
+
+# Describe PVC
+kubectl describe pvc data-my-cluster-0
+
+# Wait for cloud provider to detach (can take 2-5 minutes)
+# Or manually detach via cloud provider console
+```
+
+## Emergency Maintenance (Unplanned)
+
+For unplanned node failures without maintenance mode:
+
+1. **Node becomes NotReady** - Kubernetes marks pods as `Unknown` after 5 minutes
+2. **Operator detects loss** - Status polling fails for affected pods
+3. **Failover triggers** - If primary is on failed node, operator promotes a replica
+4. **Pod rescheduling** - After 5-10 minutes, pods are rescheduled on healthy nodes
+
+<Note>
+Unplanned failures have longer recovery times (5-10 minutes) compared to planned maintenance (30-60 seconds) due to Kubernetes timeout periods.
+</Note>
+
+## Scheduling Maintenance Windows
+
+Use annotations to document maintenance windows:
+
+```yaml
+metadata:
+  annotations:
+    redis.io/maintenance-window: "Sundays 02:00-04:00 UTC"
+    redis.io/last-maintenance: "2026-02-28T02:00:00Z"
+    redis.io/next-maintenance: "2026-03-07T02:00:00Z"
+```
+
+These annotations are informational and do not affect operator behavior. Use them for coordination and documentation.

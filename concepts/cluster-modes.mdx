@@ -1,0 +1,265 @@
+---
+title: Cluster Modes
+description: Standalone vs Sentinel modes
+---
+
+## Overview
+
+Redis Operator supports two cluster modes:
+
+- **Standalone** — A single primary with N-1 replicas, managed directly by the operator
+- **Sentinel** — Redis Sentinel provides high availability monitoring and automatic failover
+
+A third mode, **Cluster** (Redis Cluster sharding), is reserved for future implementation and currently rejected by the webhook.
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: example
+spec:
+  mode: standalone  # or "sentinel"
+  instances: 3
+```
+
+See `api/v1/rediscluster_types.go:9-18` for the mode enum definition.
+
+## Standalone Mode
+
+**Default mode**: `spec.mode: standalone`
+
+### Architecture
+
+- **One primary, N-1 replicas**: The operator selects a primary pod and configures all others as replicas
+- **Operator-managed failover**: The controller detects primary failure and promotes a replica
+- **Client routing**: Applications use the `-leader` Service for writes, `-replica` for reads
+
+### When to Use Standalone
+
+- **Small to medium clusters** (1-10 instances)
+- **Predictable failover timing**: You want full control over when and how failover happens
+- **No external dependencies**: No Sentinel instances to manage
+- **Simple client configuration**: Clients connect to `<cluster>-leader:6379`
+
+### Failover Behavior
+
+See [Failover and Fencing](/concepts/failover-and-fencing) for the complete failover sequence.
+
+**Summary**:
+
+1. Controller detects primary unreachable (HTTP poll timeout)
+2. Fence the former primary
+3. Select replica with smallest replication lag
+4. Issue `POST /v1/promote` to the replica's pod IP
+5. Update `-leader` Service selector to the new primary
+6. Update `status.currentPrimary`
+7. Clear fence; former primary restarts as replica
+
+**Failover time**: Typically 10-30 seconds (depends on `--status-poll-interval` and HTTP timeout settings).
+
+### Configuration Example
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: standalone-example
+spec:
+  mode: standalone
+  instances: 3
+  storage:
+    size: 10Gi
+    storageClassName: fast-ssd
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: 1000m
+    limits:
+      memory: 2Gi
+  minSyncReplicas: 1  # Require at least 1 replica to acknowledge writes
+```
+
+<Note>
+`minSyncReplicas` and `maxSyncReplicas` control Redis's `min-replicas-to-write` and `min-replicas-max-lag` settings for synchronous replication.
+</Note>
+
+### Service Endpoints
+
+| Service | Selector | Purpose |
+|---------|----------|----------|
+| `standalone-example-leader` | `redis.io/role: primary` | Write traffic |
+| `standalone-example-replica` | `redis.io/role: replica` | Read-only traffic |
+| `standalone-example-any` | `redis.io/cluster: standalone-example` | Any instance |
+
+### Primary Selection
+
+On initial cluster creation:
+
+1. The operator creates Pod-0 first with no `REPLICAOF` directive (primary)
+2. Subsequent pods start with `REPLICAOF <pod-0-ip> 6379`
+3. `status.currentPrimary` is set to `standalone-example-0`
+4. The `-leader` Service selector is updated to route to Pod-0
+
+During failover, the operator selects the replica with the **smallest `replicaLagBytes`** (closest to the former primary's replication offset).
+
+See `internal/controller/cluster/pods.go`.
+
+## Sentinel Mode
+
+**High-availability mode**: `spec.mode: sentinel`
+
+### Architecture
+
+- **Sentinel instances**: The operator creates a separate StatefulSet of Redis Sentinel processes
+- **Sentinel-managed failover**: Sentinels monitor the primary and automatically promote a replica on failure
+- **Operator orchestration**: The controller configures Sentinels, updates Services, and handles Sentinel failures
+- **Client routing**: Applications connect to Sentinel for primary discovery
+
+### When to Use Sentinel
+
+- **Large clusters** (10+ instances)
+- **Automatic failover without operator dependency**: Sentinel can fail over even if the operator controller is down
+- **Standard Redis HA pattern**: Your team already uses Sentinel in production
+- **Client library support**: Your client library has built-in Sentinel support
+
+### Sentinel Configuration
+
+**Defaults** (`api/v1/rediscluster_types.go:82-87`):
+
+- **Sentinel instances**: 3
+- **Sentinel port**: 26379
+- **Quorum**: 2 (majority of 3)
+
+**Example**:
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: sentinel-example
+spec:
+  mode: sentinel
+  instances: 5  # Data pods: 1 primary + 4 replicas
+  storage:
+    size: 20Gi
+```
+
+This creates:
+
+- **5 data pods**: `sentinel-example-0` through `sentinel-example-4`
+- **3 Sentinel pods**: `sentinel-example-sentinel-0` through `sentinel-example-sentinel-2`
+- **Sentinel Service**: `sentinel-example-sentinel` (26379)
+
+### Sentinel Failover Flow
+
+1. Sentinels monitor the primary via `PING` health checks
+2. When **quorum** Sentinels agree the primary is down (default: 2 of 3), they elect a new primary
+3. Sentinels run `REPLICAOF NO ONE` on the selected replica
+4. Sentinels reconfigure other replicas to follow the new primary
+5. The **operator** detects the new primary via Sentinel status polling
+6. The operator updates `status.currentPrimary` and the `-leader` Service selector
+
+<Info>
+Sentinel failover is typically faster than operator-managed failover (5-15 seconds) because Sentinels monitor the primary continuously.
+</Info>
+
+### Client Configuration
+
+**Sentinel-aware clients** (e.g., `redis-py`, `Jedis`, `node-redis` with Sentinel support):
+
+```python
+from redis.sentinel import Sentinel
+
+sentinel = Sentinel([
+    ('sentinel-example-sentinel', 26379)
+])
+primary = sentinel.master_for('mymaster', socket_timeout=0.1)
+replica = sentinel.slave_for('mymaster', socket_timeout=0.1)
+
+primary.set('key', 'value')  # Write to primary
+value = replica.get('key')    # Read from replica
+```
+
+**Standard clients** (use Kubernetes Services):
+
+- `sentinel-example-leader:6379` — Write traffic (operator updates selector on failover)
+- `sentinel-example-replica:6379` — Read-only traffic
+
+### Operator vs. Sentinel Responsibilities
+
+| Responsibility | Standalone Mode | Sentinel Mode |
+|----------------|-----------------|---------------|
+| Primary health monitoring | Operator (HTTP poll) | Sentinel (`PING`) |
+| Replica selection | Operator (smallest lag) | Sentinel (configured priority) |
+| Promotion command | Operator (`POST /v1/promote`) | Sentinel (`REPLICAOF NO ONE`) |
+| Service selector update | Operator | Operator |
+| `status.currentPrimary` update | Operator | Operator |
+| Replica reconfiguration | Operator | Sentinel |
+
+<Note>
+Even in Sentinel mode, the operator remains authoritative for Kubernetes resources (Services, Pods, PVCs). Sentinel handles Redis-level failover; the operator synchronizes Kubernetes state.
+</Note>
+
+### Sentinel Pod Lifecycle
+
+Sentinel pods are managed by a **StatefulSet** (data pods are not). The operator:
+
+- Creates the Sentinel StatefulSet with 3 replicas (default)
+- Configures `sentinel.conf` via ConfigMap
+- Monitors Sentinel health via `sentinel.status.sentinelReadyInstances`
+- Updates Sentinel configuration when the primary changes
+
+See `internal/controller/cluster/sentinel.go` and `internal/instance-manager/run/sentinel.go`.
+
+## Cluster Mode (Reserved)
+
+**Status**: Not implemented. The webhook rejects `spec.mode: cluster`.
+
+**Planned features**:
+
+- Redis Cluster sharding (16384 hash slots)
+- Horizontal scalability across multiple primaries
+- Automatic data distribution and rebalancing
+- Client-side cluster protocol support
+
+<Warning>
+`spec.mode: cluster` is reserved and intentionally not implemented. Do not attempt to use it. The webhook will reject the resource with an error.
+</Warning>
+
+See `AGENTS.md:25`.
+
+## Mode Comparison
+
+| Feature | Standalone | Sentinel | Cluster (Reserved) |
+|---------|------------|----------|--------------------|
+| **Primary pods** | 1 | 1 | N (multiple primaries) |
+| **Replica pods** | N-1 | N-1 | M per primary |
+| **Sentinel pods** | 0 | 3 (default) | 0 |
+| **Failover control** | Operator | Sentinel + Operator | Redis Cluster |
+| **Failover time** | 10-30s | 5-15s | {'<'}5s |
+| **Scalability** | Vertical (bigger pods) | Vertical | Horizontal (more primaries) |
+| **Client complexity** | Low (single endpoint) | Medium (Sentinel protocol) | High (cluster protocol) |
+| **Operator dependency** | High (no operator = no failover) | Low (Sentinel can fail over) | Low |
+| **Use case** | Small/medium clusters | Large HA clusters | Multi-tenant, high throughput |
+
+## Switching Modes
+
+<Warning>
+Changing `spec.mode` on an existing cluster is **not supported**. You must create a new cluster and migrate data.
+</Warning>
+
+**Migration path**:
+
+1. Create a new `RedisCluster` with the desired mode
+2. Use `RedisBackup` to back up the old cluster
+3. Restore the backup into the new cluster via `spec.bootstrap.backupName`
+4. Update application endpoints to the new cluster's Services
+5. Delete the old cluster
+
+Alternatively, use [Replica Mode](/configuration/replica-mode) to set up external replication from the old cluster to the new cluster, then promote the new cluster.
+
+## Next Steps
+
+- [Failover and Fencing](/concepts/failover-and-fencing) — Deep dive into failover mechanics
+- [Architecture](/concepts/architecture) — Understand the split control/data plane
+- [Comparison](/concepts/comparison) — How Redis Operator compares to alternatives

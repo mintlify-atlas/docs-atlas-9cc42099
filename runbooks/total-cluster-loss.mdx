@@ -1,0 +1,110 @@
+---
+title: Total Cluster Loss Recovery
+description: Recovery procedure when all pods are deleted but PVCs remain intact
+---
+
+**Severity**: P1  
+**Estimated time**: 15-30 minutes
+
+Use this when all Redis data pods are gone but the PVCs still exist. The operator should recreate pods and reattach existing PVCs.
+
+## Symptoms
+
+- No data pods exist for the cluster.
+- PVCs named `<cluster>-data-<index>` still exist.
+- `RedisCluster` is degraded or stuck in non-healthy phase.
+
+## Prerequisites
+
+- Operator deployment is running.
+- PVCs for the cluster are intact.
+- Shell variables:
+
+```bash
+export NS=<rediscluster-namespace>
+export CLUSTER=<rediscluster-name>
+```
+
+## Diagnosis
+
+<Steps>
+  <Step title="Confirm data pods are missing">
+    ```bash
+    kubectl get pods -n "$NS" -l redis.io/cluster="$CLUSTER",redis.io/workload=data
+    ```
+  </Step>
+
+  <Step title="Confirm PVCs are still present">
+    ```bash
+    kubectl get pvc -n "$NS" -l redis.io/cluster="$CLUSTER"
+    ```
+  </Step>
+
+  <Step title="Check desired instance count and current primary">
+    ```bash
+    kubectl get rediscluster "$CLUSTER" -n "$NS" -o jsonpath='{.spec.instances}{"\n"}'
+    kubectl get rediscluster "$CLUSTER" -n "$NS" -o jsonpath='{.status.currentPrimary}{"\n"}'
+    ```
+  </Step>
+</Steps>
+
+## Recovery Steps
+
+<Steps>
+  <Step title="Do not delete PVCs">
+    <Warning>
+      Do NOT delete any PVCs. They contain your data and will be reattached automatically.
+    </Warning>
+  </Step>
+
+  <Step title="Trigger immediate reconciliation by touching an annotation">
+    ```bash
+    kubectl annotate rediscluster "$CLUSTER" -n "$NS" \
+      runbooks.redis.io/recover-from-pod-loss-ts="$(date +%s)" --overwrite
+    ```
+  </Step>
+
+  <Step title="Watch pod recreation">
+    ```bash
+    kubectl get pods -n "$NS" -l redis.io/cluster="$CLUSTER",redis.io/workload=data -w
+    ```
+  </Step>
+
+  <Step title="If pods are not recreated within ~60 seconds, check operator logs/events">
+    ```bash
+    kubectl get events -n "$NS" \
+      --field-selector involvedObject.kind=RedisCluster,involvedObject.name="$CLUSTER" \
+      --sort-by=.lastTimestamp
+    ```
+
+    Resolve operator health first if needed.
+  </Step>
+
+  <Step title="Verify recreated pods are bound to expected PVC names">
+    ```bash
+    kubectl get pod -n "$NS" -l redis.io/cluster="$CLUSTER",redis.io/workload=data \
+      -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}{"\n"}{end}'
+    ```
+  </Step>
+</Steps>
+
+## Verification
+
+```bash
+kubectl get rediscluster "$CLUSTER" -n "$NS" -o jsonpath='{.status.currentPrimary}{"\n"}'
+kubectl get rediscluster "$CLUSTER" -n "$NS" -o jsonpath='{.status.readyInstances}{"\n"}'
+kubectl get rediscluster "$CLUSTER" -n "$NS" -o jsonpath='{.status.phase}{"\n"}'
+kubectl get pvc -n "$NS" -l redis.io/cluster="$CLUSTER"
+```
+
+Expected:
+- Data pods are recreated to match `spec.instances`.
+- Pods are attached to existing `<cluster>-data-<index>` PVCs.
+- `status.currentPrimary` is set and reachable.
+- Cluster returns to `Healthy`.
+
+## Escalation
+
+- If PVCs are missing or failed to bind, escalate to storage/platform team.
+- If pods recreate but Redis cannot start from PVC data, move to [PVC Corruption](/runbooks/pvc-corruption) for per-replica recovery.
+- If no primary becomes available, follow [Manual Failover](/runbooks/manual-failover).

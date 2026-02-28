@@ -1,0 +1,198 @@
+---
+title: RedisScheduledBackup CRD
+description: API reference for the RedisScheduledBackup custom resource
+---
+
+## Overview
+
+The `RedisScheduledBackup` custom resource defines a cron-based backup schedule for a RedisCluster. It automatically creates `RedisBackup` resources on schedule.
+
+**API Group:** `redis.io/v1`  
+**Kind:** `RedisScheduledBackup`  
+**Short Name:** `rsb`
+
+## Spec Fields
+
+<ParamField path="schedule" type="string" required>
+  Cron expression defining when to run backups
+  
+  **Constraints:**
+  - Minimum length: `1`
+  
+  **Format:** Standard cron syntax (minute hour day month weekday)
+  
+  **Examples:**
+  - `0 2 * * *` - Daily at 2:00 AM
+  - `0 */6 * * *` - Every 6 hours
+  - `0 0 * * 0` - Weekly on Sunday at midnight
+  - `0 3 1 * *` - Monthly on the 1st at 3:00 AM
+</ParamField>
+
+<ParamField path="clusterName" type="string" required>
+  Name of the RedisCluster to back up
+</ParamField>
+
+<ParamField path="target" type="BackupTarget" default="prefer-replica">
+  Specifies which pod to run the backup on
+  
+  **Enum values:**
+  - `primary` - Always run backup on the primary instance
+  - `prefer-replica` - Run on a replica if available, otherwise on the primary
+</ParamField>
+
+<ParamField path="method" type="BackupMethod" default="rdb">
+  Backup method to use
+  
+  **Enum values:**
+  - `rdb` - Redis Database file (point-in-time snapshot via `BGSAVE`)
+  - `aof` - Append-only file (via `BGREWRITEAOF`, archived as `.tar.gz`)
+</ParamField>
+
+<ParamField path="destination" type="BackupDestination">
+  Defines where to store the backup
+  
+  See [RedisBackup destination field](/api/redisbackup#spec-fields) for full schema.
+</ParamField>
+
+<ParamField path="suspend" type="bool" default="false">
+  Stops future backups from being scheduled when `true`
+  
+  Existing backups continue to completion. Does not delete previously created RedisBackup resources.
+</ParamField>
+
+<ParamField path="successfulBackupsHistoryLimit" type="int32" default="3">
+  Number of successful backup resources to retain
+  
+  **Constraints:**
+  - Minimum: `0`
+  
+  Older successful backups are automatically deleted.
+</ParamField>
+
+<ParamField path="failedBackupsHistoryLimit" type="int32" default="3">
+  Number of failed backup resources to retain
+  
+  **Constraints:**
+  - Minimum: `0`
+  
+  Older failed backups are automatically deleted.
+</ParamField>
+
+## Status Fields
+
+<ResponseField name="phase" type="ScheduledBackupPhase">
+  Current phase
+  
+  **Possible values:**
+  - `Active` - Schedule is running
+  - `Suspended` - Schedule is suspended via `spec.suspend`
+</ResponseField>
+
+<ResponseField name="lastScheduleTime" type="metav1.Time">
+  Last time a backup was triggered
+</ResponseField>
+
+<ResponseField name="nextScheduleTime" type="metav1.Time">
+  When the next backup will be triggered
+</ResponseField>
+
+<ResponseField name="lastBackupName" type="string">
+  Name of the most recently created RedisBackup resource
+  
+  **Example:** `my-scheduled-backup-20260228100000`
+</ResponseField>
+
+<ResponseField name="conditions" type="[]metav1.Condition">
+  Latest available observations
+</ResponseField>
+
+## Backup Naming
+
+Created RedisBackup resources follow this naming pattern:
+
+```
+<scheduled-backup-name>-<timestamp>
+```
+
+**Example:**
+- ScheduledBackup name: `hourly-backups`
+- Generated backup name: `hourly-backups-20260228143000`
+
+Timestamp format: `YYYYMMDDHHmmss` (UTC)
+
+## History Management
+
+The controller automatically prunes old backup resources based on:
+- `successfulBackupsHistoryLimit` - Retains N most recent successful backups
+- `failedBackupsHistoryLimit` - Retains N most recent failed backups
+
+Pruning occurs after each scheduled backup completes.
+
+**Note:** This only deletes the Kubernetes `RedisBackup` resource. Object storage cleanup must be handled separately (e.g., via S3 lifecycle policies).
+
+## Suspend Behavior
+
+When `spec.suspend` is set to `true`:
+1. Status phase transitions to `Suspended`
+2. No new backups are scheduled
+3. `nextScheduleTime` is cleared
+4. In-progress backups continue to completion
+5. Existing RedisBackup resources are not deleted
+
+Setting `spec.suspend` back to `false` resumes the schedule.
+
+## Example
+
+### Daily Backups
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisScheduledBackup
+metadata:
+  name: daily-backups
+  namespace: default
+spec:
+  schedule: "0 2 * * *"  # 2:00 AM daily
+  clusterName: my-redis
+  target: prefer-replica
+  method: rdb
+  destination:
+    s3:
+      bucket: my-backup-bucket
+      path: daily
+      region: us-west-2
+  successfulBackupsHistoryLimit: 7
+  failedBackupsHistoryLimit: 3
+```
+
+### Hourly Backups (Suspended)
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisScheduledBackup
+metadata:
+  name: hourly-backups
+  namespace: default
+spec:
+  schedule: "0 * * * *"  # Every hour
+  clusterName: my-redis
+  target: prefer-replica
+  method: rdb
+  destination:
+    s3:
+      bucket: my-backup-bucket
+      path: hourly
+      region: us-west-2
+  suspend: true
+  successfulBackupsHistoryLimit: 24
+  failedBackupsHistoryLimit: 5
+```
+
+**Status:**
+```yaml
+status:
+  phase: Active
+  lastScheduleTime: "2026-02-28T10:00:00Z"
+  nextScheduleTime: "2026-02-28T11:00:00Z"
+  lastBackupName: hourly-backups-20260228100000
+```

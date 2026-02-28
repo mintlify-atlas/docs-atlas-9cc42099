@@ -1,0 +1,437 @@
+---
+title: Installation
+description: Install Redis Operator CRDs and Helm chart on your Kubernetes cluster
+---
+
+## Prerequisites
+
+Before installing Redis Operator, ensure you have:
+
+- Kubernetes 1.25 or later
+- `kubectl` configured to access your cluster
+- Helm 3.8 or later (for Helm installation)
+- Cluster-admin permissions to install CRDs and RBAC resources
+
+<Note>
+The operator requires cluster-wide permissions to manage RedisCluster resources across namespaces.
+</Note>
+
+## Installation Methods
+
+<Steps>
+  <Step title="Install CRDs">
+    Install the Custom Resource Definitions for RedisCluster, RedisBackup, and RedisScheduledBackup:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/howl-cloud/redis-operator/main/config/crd/bases/redis.io_redisclusters.yaml
+    kubectl apply -f https://raw.githubusercontent.com/howl-cloud/redis-operator/main/config/crd/bases/redis.io_redisbackups.yaml
+    kubectl apply -f https://raw.githubusercontent.com/howl-cloud/redis-operator/main/config/crd/bases/redis.io_redisscheduledbackups.yaml
+    ```
+
+    Verify the CRDs are installed:
+
+    ```bash
+    kubectl get crds | grep redis.io
+    ```
+
+    Expected output:
+    ```
+    redisbackups.redis.io                          2026-02-28T10:30:00Z
+    redisclusters.redis.io                         2026-02-28T10:30:00Z
+    redisscheduledbackups.redis.io                 2026-02-28T10:30:00Z
+    ```
+  </Step>
+
+  <Step title="Install the Operator">
+    Install the operator using Helm:
+
+    ```bash
+    helm upgrade --install redis-operator oci://ghcr.io/howl-cloud/charts/redis-operator \
+      --namespace redis-operator-system \
+      --create-namespace \
+      --version 0.1.0
+    ```
+
+    <Note>
+    The operator runs as a single replica with leader election enabled by default. For production, this provides high availability if the pod is rescheduled.
+    </Note>
+  </Step>
+
+  <Step title="Verify Installation">
+    Check that the operator is running:
+
+    ```bash
+    kubectl get pods -n redis-operator-system
+    ```
+
+    Expected output:
+    ```
+    NAME                              READY   STATUS    RESTARTS   AGE
+    redis-operator-7d4b9c5f6b-xyz12   1/1     Running   0          30s
+    ```
+
+    Check the operator logs:
+
+    ```bash
+    kubectl logs -n redis-operator-system -l app.kubernetes.io/name=redis-operator
+    ```
+  </Step>
+</Steps>
+
+## Helm Configuration
+
+The Helm chart exposes the following configuration values from `charts/redis-operator/Chart.yaml`:
+
+**Chart Metadata:**
+- **Version**: `0.1.0`
+- **App Version**: `0.1.0`
+- **Description**: A Kubernetes operator for managing Redis 7.2 clusters with automatic failover, rolling updates, and backup support
+
+### Common Configuration Options
+
+<CodeGroup>
+
+```yaml values.yaml (Default)
+# Number of operator replicas (usually 1 with leader election)
+replicaCount: 1
+
+image:
+  repository: redis-operator
+  pullPolicy: IfNotPresent
+  tag: ""  # Defaults to chart appVersion
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+leaderElection:
+  enabled: true
+
+metrics:
+  enabled: true
+  port: 9090
+
+webhook:
+  enabled: true
+  port: 9443
+```
+
+```yaml values.yaml (Production)
+# Production configuration with monitoring
+replicaCount: 1
+
+image:
+  repository: ghcr.io/howl-cloud/redis-operator
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+leaderElection:
+  enabled: true
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+
+monitoring:
+  alertingRules:
+    enabled: true
+    replicationLagThresholdBytes: 10485760
+    memoryUsageThresholdRatio: 0.85
+    backupMissingSeconds: 86400
+  
+  grafanaDashboard:
+    enabled: true
+  
+  podMonitor:
+    enabled: true
+    interval: 30s
+
+webhook:
+  enabled: true
+```
+
+```yaml values.yaml (Custom Image)
+# Use a custom image registry
+image:
+  repository: my-registry.example.com/redis-operator
+  pullPolicy: Always
+  tag: "v0.1.0"
+
+imagePullSecrets:
+  - name: my-registry-secret
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector:
+  workload-type: operators
+
+tolerations:
+  - key: "operators-only"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+```
+
+</CodeGroup>
+
+### Install with Custom Values
+
+Create a `values.yaml` file with your configuration:
+
+```yaml values.yaml
+image:
+  repository: ghcr.io/howl-cloud/redis-operator
+  tag: "0.1.0"
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+monitoring:
+  alertingRules:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+  podMonitor:
+    enabled: true
+```
+
+Install with custom values:
+
+```bash
+helm upgrade --install redis-operator oci://ghcr.io/howl-cloud/charts/redis-operator \
+  --namespace redis-operator-system \
+  --create-namespace \
+  --values values.yaml
+```
+
+## Monitoring Setup
+
+### Prometheus Metrics
+
+The operator exposes Prometheus metrics on port `9090` by default:
+
+- **Controller metrics**: Reconciliation duration, queue depth, error rates
+- **Instance metrics**: Redis instance health, replication lag, memory usage
+
+<CodeGroup>
+
+```yaml ServiceMonitor
+# Enable ServiceMonitor for operator controller metrics
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels:
+      prometheus: kube-prometheus
+```
+
+```yaml PodMonitor
+# Enable PodMonitor for Redis instance-manager metrics
+monitoring:
+  podMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels:
+      prometheus: kube-prometheus
+```
+
+</CodeGroup>
+
+### Alerting Rules
+
+Enable default Prometheus alerting rules:
+
+```yaml values.yaml
+monitoring:
+  alertingRules:
+    enabled: true
+    # Replication lag threshold (10MB default)
+    replicationLagThresholdBytes: 10485760
+    # Memory usage threshold (85% default)
+    memoryUsageThresholdRatio: 0.85
+    # Backup age threshold (24 hours default)
+    backupMissingSeconds: 86400
+```
+
+Default alerts include:
+- `RedisReplicationLagHigh`: Replica lag exceeds threshold
+- `RedisMemoryUsageHigh`: Memory usage above threshold
+- `RedisBackupMissing`: No successful backup in threshold period
+- `RedisClusterDegraded`: Cluster not in Healthy phase
+
+### Grafana Dashboard
+
+Enable the default Grafana dashboard:
+
+```yaml values.yaml
+monitoring:
+  grafanaDashboard:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
+```
+
+The dashboard includes:
+- Cluster health and phase transitions
+- Replication lag and topology
+- Memory usage and eviction rates
+- Operations per second and latency
+- Backup success rates
+
+## Webhook Configuration
+
+<Note>
+The operator includes admission webhooks for validation and defaulting. The PKI is self-managed and does not require cert-manager.
+</Note>
+
+Webhooks are enabled by default:
+
+```yaml values.yaml
+webhook:
+  enabled: true
+  port: 9443
+  # Leave empty to auto-generate and rotate certificates
+  certSecretName: ""
+```
+
+The operator automatically:
+1. Generates a self-signed CA
+2. Issues a server certificate for the webhook service
+3. Rotates certificates before expiration
+4. Updates `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` with the CA bundle
+
+### Disable Webhooks
+
+<Warning>
+Disabling webhooks removes validation and defaulting. Invalid configurations may be accepted and cause reconciliation failures.
+</Warning>
+
+To disable webhooks:
+
+```bash
+helm upgrade --install redis-operator oci://ghcr.io/howl-cloud/charts/redis-operator \
+  --namespace redis-operator-system \
+  --create-namespace \
+  --set webhook.enabled=false
+```
+
+## RBAC and Security
+
+The operator requires cluster-wide permissions defined in `config/rbac/role.yaml`:
+
+- **Cluster-scoped**: CRDs, ClusterRoles, ClusterRoleBindings
+- **Namespace-scoped**: Pods, PVCs, Services, Secrets, ConfigMaps, Events
+- **Leader election**: Leases in the operator namespace
+
+All resources are created with:
+
+```yaml Security Context (Pod)
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+```yaml Security Context (Container)
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+```
+
+## Upgrade the Operator
+
+Upgrade to a new version:
+
+```bash
+helm upgrade redis-operator oci://ghcr.io/howl-cloud/charts/redis-operator \
+  --namespace redis-operator-system \
+  --version 0.2.0
+```
+
+<Note>
+Upgrading the operator does not automatically upgrade existing Redis clusters. You must update the `spec.imageName` field in each RedisCluster resource to trigger a rolling update.
+</Note>
+
+## Uninstall
+
+Uninstall the operator:
+
+```bash
+helm uninstall redis-operator --namespace redis-operator-system
+```
+
+<Warning>
+Uninstalling the operator does NOT delete existing RedisCluster resources or their data. The CRDs and custom resources remain in the cluster.
+</Warning>
+
+To completely remove the operator and CRDs:
+
+```bash
+# Delete all RedisCluster resources first
+kubectl delete redisclusters --all --all-namespaces
+
+# Uninstall the operator
+helm uninstall redis-operator --namespace redis-operator-system
+
+# Delete CRDs (this deletes all custom resources)
+kubectl delete crd redisclusters.redis.io
+kubectl delete crd redisbackups.redis.io
+kubectl delete crd redisscheduledbackups.redis.io
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Quick Start"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Deploy your first Redis cluster
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Explore RedisCluster configuration options
+  </Card>
+</CardGroup>

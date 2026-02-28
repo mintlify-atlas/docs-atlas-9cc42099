@@ -1,0 +1,350 @@
+---
+title: Comparison with Other Redis Operators
+description: How Redis Operator compares to alternatives
+---
+
+## Overview
+
+This document compares Redis Operator with other popular Kubernetes Redis operators, focusing on architectural differences, safety guarantees, and operational trade-offs.
+
+**Primary comparison**: OpsTree Redis Operator (`OT-CONTAINER-KIT/redis-operator`)
+
+**TL;DR**: If you want Redis operations that are more strict, safety-first, and predictable during failures and upgrades, Redis Operator is the better fit.
+
+## Redis Operator vs. OpsTree Redis Operator
+
+Comparison based on:
+
+- **Redis Operator** (HoWL): `howl-cloud/redis-operator` at `6a2367d`
+- **OpsTree**: `OT-CONTAINER-KIT/redis-operator` at `7ae2c18`
+
+See `source/docs/comparison.md` for the original analysis.
+
+### 1. Safer Failover Flow
+
+**Redis Operator**:
+
+- **Fencing-first**: Fence the old primary **before** promoting a replica
+- **Explicit sequence**: Controller sets fence annotation → stops Redis on old primary → promotes replica → updates Services
+- **Pod IP targeting**: Promotion command targets the exact replica pod via HTTP (`POST http://<pod-ip>:9121/v1/promote`)
+
+**OpsTree**:
+
+- **Sentinel-driven**: Relies on Redis Sentinel for automatic failover orchestration
+- **No explicit fencing**: Sentinel uses quorum-based leader election; no equivalent controller-level fencing contract
+- **StatefulSet-centric**: Failover is triggered by Sentinel, controller syncs Kubernetes resources afterward
+
+<Note>
+**Why this matters**: Redis Operator puts a "stop writing" sign on the old leader before choosing a new one, reducing split-brain risk.
+</Note>
+
+See `internal/controller/cluster/fencing.go:49-58` and [Failover and Fencing](/concepts/failover-and-fencing).
+
+### 2. Split-Brain Defense at Startup and Runtime
+
+**Redis Operator**:
+
+- **Boot-time guard** (`internal/instance-manager/run/run.go:63-66`): If a restarting pod is not `status.currentPrimary`, it is **forced to start as a replica** (`REPLICAOF`), regardless of local data
+- **Runtime guard** (`internal/instance-manager/webserver/server.go`): A primary can fail liveness probes if it is isolated from both the API server and peers, so Kubernetes replaces it
+
+**OpsTree**:
+
+- **Health probes**: Primarily `redis-cli ping` style checks in StatefulSet configuration
+- **No boot-time role guard**: Relies on Sentinel to reconfigure roles after pod restart
+
+<Info>
+**Why this matters**: Redis Operator is more aggressive about avoiding "isolated primary keeps accepting writes" scenarios.
+</Info>
+
+See [Failover and Fencing](/concepts/failover-and-fencing#split-brain-prevention).
+
+### 3. More Predictable Primary Upgrades
+
+**Redis Operator**:
+
+- **Replica-first rolling updates**: Update replicas first (highest ordinal), then promote a replica to primary and delete the old primary last
+- **Supervised mode**: `spec.primaryUpdateStrategy: supervised` pauses before touching the primary and waits for explicit user approval via annotation
+- **Zero-downtime switchover**: Promote a replica → wait for confirmation → delete old primary
+
+**OpsTree**:
+
+- **StatefulSet update strategy**: Relies on `RollingUpdate` with `partition` or `OnDelete` strategies
+- **No operator-level primary gate**: Updates follow standard StatefulSet ordering (ascending by ordinal)
+
+<Note>
+**Why this matters**: Primary change is the riskiest step, and Redis Operator lets you gate it on purpose.
+</Note>
+
+See `api/v1/rediscluster_types.go:20-27` and [Upgrades](/operations/upgrades).
+
+### 4. Pod-Precise Control Plane
+
+**Redis Operator**:
+
+- **Direct pod IP targeting**: Controller calls instance manager HTTP endpoints (`/v1/status`, `/v1/promote`, `/v1/backup`) via pod IP
+- **Instance manager HTTP API**: Exposes endpoints for promotion, backup, and status polling
+- **No load balancers**: Critical operations bypass Services to target the exact pod
+
+**OpsTree**:
+
+- **Controller + StatefulSet + Redis/Sentinel command model**: No equivalent in-pod instance-manager API endpoints
+- **Service-based routing**: Operations typically use Services or direct `redis-cli` commands
+
+<Info>
+**Why this matters**: Redis Operator can reliably act on the exact pod you intended, avoiding load-balancer unpredictability.
+</Info>
+
+See [Architecture](/concepts/architecture#http-api-secondary).
+
+### 5. Stronger Secret Hygiene by Default
+
+**Redis Operator**:
+
+- **Projected volumes only**: Auth, ACL, and TLS secrets are mounted at `/projected` and `/tls` as projected volumes
+- **No env vars**: Redis credentials are **never** injected via environment variables
+- **Automatic rotation**: Kubernetes syncs secret updates to pods; instance manager applies changes live via `CONFIG SET` or `ACL LOAD` (no restart)
+
+**OpsTree**:
+
+- **Env var injection**: `internal/k8sutils/statefulset.go` includes `REDIS_PASSWORD` via `SecretKeyRef` environment variable
+- **Manual rotation**: Password changes may require pod restarts
+
+<Warning>
+**Why this matters**: File-mounted secrets are generally preferred over env-var exposure for security (env vars are visible in pod specs, logs, and crash dumps).
+</Warning>
+
+See `internal/controller/cluster/pods.go` and `internal/controller/cluster/secrets.go:33-41`.
+
+### 6. Richer Per-Pod Status for Operations
+
+**Redis Operator**:
+
+- **Map-based status**: `status.instancesStatus` is a map keyed by pod name
+- **Per-pod metrics**: Role, connectivity, replication offset, lag, connected replicas, master link status, last seen timestamp
+- **Structured conditions**: Kubernetes conditions for `Ready`, `PrimaryAvailable`, `ReplicationHealthy`, etc.
+
+**OpsTree**:
+
+- **Coarse status**: Key APIs report `masterNode`, cluster state/reason, ready leader/follower counts
+- **Less granular**: No equivalent per-pod replication offset or lag tracking in status
+
+<Note>
+**Why this matters**: Better incident debugging and more precise automation logic (e.g., selecting the replica with the smallest lag for promotion).
+</Note>
+
+See `api/v1/rediscluster_types.go:319-322` and `internal/controller/cluster/status.go`.
+
+### 7. Avoids StatefulSet Immutability Constraints
+
+**Redis Operator**:
+
+- **Direct Pod/PVC management**: Pods and PVCs are created and managed directly by the controller
+- **No StatefulSet**: Data pods (not Sentinel pods) are not managed by StatefulSets
+- **Flexible lifecycle**: The operator can enforce Redis-specific ordering (replicas before primary) and immediate PVC updates
+
+**OpsTree**:
+
+- **StatefulSet-heavy lifecycle**: `internal/k8sutils/statefulset.go` with explicit handling of immutable `volumeClaimTemplates`
+- **Recreate strategy**: May require StatefulSet recreation for certain PVC changes
+
+<Info>
+**Why this matters**: Redis Operator can enforce Redis-specific ordering and behavior directly, instead of fitting everything into generic StatefulSet mechanics.
+</Info>
+
+See `internal/controller/cluster/pods.go`, `internal/controller/cluster/pvcs.go`, and [Design Principles](/concepts/design-principles#3-direct-podpvc-management).
+
+## Where OpsTree Is Strong
+
+This comparison is not "OpsTree is bad." OpsTree has clear strengths:
+
+### 1. Broad Mode Support
+
+OpsTree supports multiple Redis topologies in a single operator:
+
+- **Standalone** (single instance)
+- **Replication** (primary + replicas)
+- **Sentinel** (high availability)
+- **Cluster** (Redis Cluster sharding)
+
+**Redis Operator** currently supports:
+
+- **Standalone** (primary + replicas)
+- **Sentinel** (high availability)
+- **Cluster** (reserved, not yet implemented)
+
+<Note>
+If you need Redis Cluster sharding **today**, OpsTree is the better choice.
+</Note>
+
+### 2. Mature StatefulSet-Native Workflows
+
+OpsTree follows standard Kubernetes patterns:
+
+- **StatefulSets** for pod management
+- **Familiar operational model**: `kubectl scale`, `kubectl rollout status`, etc.
+- **Well-documented**: Extensive Helm charts, examples, and runbooks
+
+**Trade-off**: Less flexibility for Redis-specific operational requirements (e.g., replica-first updates, fencing).
+
+### 3. Strong Built-In Metrics Patterns
+
+OpsTree includes:
+
+- **redis-exporter** integration out of the box
+- **Prometheus/Grafana** documentation and dashboards
+- **Service monitors** for automatic Prometheus scraping
+
+**Redis Operator**: Metrics integration is user-managed (add a sidecar or ServiceMonitor manually).
+
+## Other Redis Operators
+
+### Spotahome Redis Operator
+
+**Repository**: `spotahome/redis-operator`
+
+**Strengths**:
+
+- Mature and widely deployed
+- Sentinel-based high availability
+- Strong community support
+
+**Limitations**:
+
+- Primarily Sentinel-focused (limited standalone mode)
+- No direct Pod/PVC management (uses StatefulSets)
+- Fewer safety guarantees during failover (no explicit fencing)
+
+### Redis Enterprise Operator
+
+**Repository**: `RedisLabs/redis-enterprise-k8s-docs`
+
+**Strengths**:
+
+- Commercial support from Redis Ltd.
+- Advanced features (Active-Active geo-replication, Redis on Flash)
+- High performance and scalability
+
+**Limitations**:
+
+- **Proprietary**: Requires Redis Enterprise license
+- **Complexity**: Heavier operational overhead
+- **Cost**: Not suitable for small teams or open-source projects
+
+### KubeDB Redis
+
+**Repository**: `kubedb/redis`
+
+**Strengths**:
+
+- Part of the KubeDB ecosystem (unified operator for multiple databases)
+- Supports Redis Cluster and Sentinel modes
+- Built-in backup/restore integration
+
+**Limitations**:
+
+- **Commercial**: Requires KubeDB Enterprise license for advanced features
+- **Opinionated**: Tightly coupled to KubeDB workflows
+- **Less Kubernetes-native**: Custom CRDs and workflows differ from standard Kubernetes patterns
+
+## Decision Guide
+
+### Choose Redis Operator if:
+
+- **Safety is paramount**: You need fencing-first failover and split-brain prevention
+- **Predictable upgrades**: You want controlled primary updates with approval gates
+- **Direct control**: You prefer pod-precise operations over generic StatefulSet workflows
+- **CloudNativePG inspiration**: You value the CNPG design philosophy for stateful workloads
+- **Open source**: You want a fully open-source solution with no license fees
+
+### Choose OpsTree if:
+
+- **Broad topology support**: You need Redis Cluster sharding today
+- **StatefulSet-native**: Your team is comfortable with standard Kubernetes patterns
+- **Mature ecosystem**: You want extensive Helm charts, examples, and community support
+- **Metrics integration**: You need built-in Prometheus/Grafana integration
+
+### Choose Spotahome if:
+
+- **Sentinel-focused**: You primarily use Redis Sentinel for high availability
+- **Mature and stable**: You prioritize a widely deployed, battle-tested operator
+- **Community support**: You value a large user base and active community
+
+### Choose Redis Enterprise if:
+
+- **Commercial support**: You need enterprise SLAs and support contracts
+- **Advanced features**: You require Active-Active geo-replication or Redis on Flash
+- **Budget**: You have budget for a commercial Redis solution
+
+### Choose KubeDB if:
+
+- **Multi-database**: You run multiple databases (Postgres, MySQL, MongoDB) and want a unified operator
+- **Integrated backup**: You need built-in backup/restore workflows
+- **Commercial support**: You have budget for KubeDB Enterprise
+
+## Feature Comparison Matrix
+
+| Feature | Redis Operator | OpsTree | Spotahome | Redis Enterprise | KubeDB |
+|---------|----------------|---------|-----------|------------------|--------|
+| **Open Source** | ✅ | ✅ | ✅ | ❌ | ⚠️ (Enterprise features) |
+| **Standalone Mode** | ✅ | ✅ | ⚠️ (limited) | ✅ | ✅ |
+| **Sentinel Mode** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Redis Cluster** | ⏳ (reserved) | ✅ | ❌ | ✅ | ✅ |
+| **Fencing-First Failover** | ✅ | ❌ | ❌ | ✅ | ❌ |
+| **Boot-Time Split-Brain Guard** | ✅ | ❌ | ❌ | ✅ | ❌ |
+| **Supervised Primary Update** | ✅ | ❌ | ❌ | ✅ | ❌ |
+| **Direct Pod/PVC Management** | ✅ | ❌ | ❌ | ⚠️ (proprietary) | ❌ |
+| **Pod IP Targeting** | ✅ | ❌ | ❌ | ⚠️ (proprietary) | ❌ |
+| **Projected Volume Secrets** | ✅ | ⚠️ (env vars) | ⚠️ (env vars) | ✅ | ⚠️ (env vars) |
+| **Per-Pod Status Tracking** | ✅ | ⚠️ (coarse) | ⚠️ (coarse) | ✅ | ⚠️ (coarse) |
+| **Built-In Metrics** | ⚠️ (user-managed) | ✅ | ✅ | ✅ | ✅ |
+| **Backup/Restore** | ✅ | ✅ | ⚠️ (limited) | ✅ | ✅ |
+| **Commercial Support** | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **Active-Active Geo-Replication** | ⚠️ (replica mode) | ❌ | ❌ | ✅ | ❌ |
+
+**Legend**:
+
+- ✅ Fully supported
+- ⚠️ Partial support or requires manual configuration
+- ❌ Not supported
+- ⏳ Planned but not yet implemented
+
+## Philosophy Differences
+
+| Aspect | Redis Operator | OpsTree |
+|--------|----------------|----------|
+| **Inspiration** | CloudNativePG (safety-first stateful workloads) | Standard Kubernetes patterns (StatefulSets) |
+| **Failover** | Operator-managed fencing-first (standalone) or Sentinel | Sentinel-driven |
+| **Pod management** | Direct Pod/PVC lifecycle control | StatefulSet-based |
+| **Primary updates** | Replica-first with optional approval gate | StatefulSet rolling update |
+| **Split-brain prevention** | Fencing + boot-time guard + runtime isolation checks | Sentinel quorum |
+| **Secret injection** | Projected volumes only | Environment variables + projected volumes |
+| **Status tracking** | Rich per-pod metrics (map-based) | Coarse cluster-level metrics |
+| **Operational model** | Pod-precise HTTP API + Kubernetes API | Kubernetes API + Redis/Sentinel commands |
+
+## Migration Path
+
+### From OpsTree to Redis Operator
+
+1. **Backup your data**: Use OpsTree's backup mechanism or create a manual RDB snapshot
+2. **Create a Redis Operator cluster**: Deploy a new `RedisCluster` with `spec.bootstrap.backupName` pointing to the backup
+3. **Validate data**: Connect to the new cluster and verify data integrity
+4. **Update application endpoints**: Point applications to the new cluster's Services
+5. **Monitor**: Observe the new cluster under production load
+6. **Decommission OpsTree cluster**: Delete the old cluster once confident
+
+Alternatively, use [Replica Mode](/configuration/replica-mode) to set up external replication from the OpsTree cluster to the Redis Operator cluster, then promote the Redis Operator cluster.
+
+### From Redis Operator to OpsTree
+
+Same process in reverse:
+
+1. Backup via `RedisBackup`
+2. Deploy OpsTree cluster and restore from backup
+3. Update application endpoints
+4. Decommission Redis Operator cluster
+
+## Next Steps
+
+- [Architecture](/concepts/architecture) — Understand the split control/data plane
+- [Design Principles](/concepts/design-principles) — Learn the CloudNativePG-inspired philosophy
+- [Failover and Fencing](/concepts/failover-and-fencing) — Deep dive into split-brain prevention

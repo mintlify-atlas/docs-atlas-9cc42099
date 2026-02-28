@@ -1,0 +1,427 @@
+---
+title: Failover and Fencing
+description: Failover behavior and split-brain prevention
+---
+
+## Overview
+
+Redis Operator implements a **fencing-first failover** strategy inspired by CloudNativePG. The core principle:
+
+<Note>
+**Always fence the old primary before promoting a new one.**
+</Note>
+
+This prevents split-brain scenarios where two primaries accept writes simultaneously, leading to data divergence and loss.
+
+## Fencing-First Failover Sequence
+
+When the controller detects the primary is unreachable, it executes the following steps in strict order:
+
+### Step 1: Detect Primary Failure
+
+The controller polls each instance manager via `GET http://<pod-ip>:9121/v1/status` at regular intervals (default: every 5 seconds).
+
+**Failure conditions**:
+
+- HTTP request timeout (default: 2 seconds)
+- HTTP 5xx error
+- Connection refused (pod not running)
+- Pod marked for deletion (`metadata.deletionTimestamp` set)
+
+**Status tracking** (`internal/controller/cluster/status.go:12-14`):
+
+```go
+status.instancesStatus[podName] = InstanceStatus{
+    Connected: false,
+    LastSeenAt: &metav1.Time{Time: time.Now()},
+}
+```
+
+If the current primary's `Connected` field is `false` for two consecutive reconcile cycles, the controller initiates failover.
+
+### Step 2: Fence the Former Primary
+
+**Before promoting any replica**, the controller sets a fencing annotation on the `RedisCluster` resource:
+
+```yaml
+metadata:
+  annotations:
+    redis.io/fencedInstances: '["example-0"]'
+```
+
+**Fencing effect** (`internal/instance-manager/reconciler/reconciler.go`):
+
+The instance manager watches for this annotation. When a pod's name appears in `redis.io/fencedInstances`:
+
+1. The instance manager **immediately stops `redis-server`** (sends `SIGTERM`, waits for graceful shutdown)
+2. The instance manager **refuses to restart Redis** until the annotation is cleared
+3. Kubernetes liveness probe fails → pod is marked unhealthy
+4. Kubernetes readiness probe fails → pod is removed from Service endpoints
+
+<Warning>
+Fencing is **irreversible** until the operator clears the annotation. A fenced pod will not accept reads or writes, even if it recovers network connectivity.
+</Warning>
+
+See `internal/controller/cluster/fencing.go:30`.
+
+### Step 3: Select a Replica to Promote
+
+The controller selects the replica with the **smallest replication lag** to minimize data loss.
+
+**Selection criteria** (`internal/controller/cluster/fencing.go`):
+
+1. **Reachable**: `status.instancesStatus[podName].Connected == true`
+2. **Is a replica**: `status.instancesStatus[podName].Role == "slave"`
+3. **Lowest lag**: Smallest `status.instancesStatus[podName].ReplicaLagBytes`
+4. **Stable ordinal**: If multiple replicas have the same lag, prefer the lowest ordinal (e.g., `example-1` over `example-2`)
+
+**Example status**:
+
+```yaml
+status:
+  instancesStatus:
+    example-0:  # Current primary (unreachable)
+      connected: false
+      role: master
+    example-1:  # Best candidate (lowest lag)
+      connected: true
+      role: slave
+      replicationOffset: 45678
+      replicaLagBytes: 120
+    example-2:  # Second choice (higher lag)
+      connected: true
+      role: slave
+      replicationOffset: 45000
+      replicaLagBytes: 798
+```
+
+The controller selects `example-1` for promotion.
+
+### Step 4: Promote the Selected Replica
+
+The controller calls the instance manager HTTP API on the selected replica's **pod IP** (not through a Service):
+
+```bash
+POST http://<example-1-pod-ip>:9121/v1/promote
+```
+
+**Instance manager promotion logic** (`internal/instance-manager/webserver/server.go`):
+
+1. Executes `REPLICAOF NO ONE` via Redis connection
+2. Waits for Redis to confirm promotion (`INFO replication` shows `role:master`)
+3. Updates `redis.conf` to remove `replicaof` directive
+4. Returns HTTP 200 on success
+
+**Promotion time**: Typically {'<'}1 second (Redis command execution + confirmation).
+
+See `internal/controller/cluster/fencing.go:52`.
+
+### Step 5: Update Services and Status
+
+The controller updates Kubernetes resources to reflect the new topology:
+
+**Service selector update** (`internal/controller/cluster/services.go`):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: example-leader
+spec:
+  selector:
+    redis.io/instance: example-1  # Changed from example-0
+    redis.io/role: primary
+```
+
+**Status update**:
+
+```yaml
+status:
+  currentPrimary: example-1  # Changed from example-0
+  phase: Healthy             # Changed from FailingOver
+```
+
+**Condition update**:
+
+```yaml
+conditions:
+- type: PrimaryAvailable
+  status: "True"
+  reason: PromotionComplete
+  message: "Promoted example-1 to primary"
+  lastTransitionTime: "2026-02-28T10:15:30Z"
+```
+
+### Step 6: Remove Fencing
+
+The controller clears the fencing annotation:
+
+```yaml
+metadata:
+  annotations:
+    redis.io/fencedInstances: '[]'  # Empty list
+```
+
+**Former primary recovery** (`internal/instance-manager/run/run.go:63-66`):
+
+1. The fenced pod (e.g., `example-0`) is no longer prevented from starting
+2. The instance manager reads `status.currentPrimary` from the `RedisCluster` CR
+3. Sees `status.currentPrimary == "example-1"` (not `example-0`)
+4. **Boot-time guard** activates: starts Redis with `REPLICAOF <example-1-ip> 6379`
+5. Redis performs partial resync (`PSYNC`) or full sync (`SYNC`) as needed
+6. Any writes the former primary accepted after failover are **discarded**
+
+See `internal/controller/cluster/fencing.go:57-58`.
+
+### Step 7: Reconfigure Other Replicas
+
+The controller updates all remaining replicas to follow the new primary:
+
+**For each replica** (`internal/controller/cluster/pods.go`):
+
+1. Send `REPLICAOF <new-primary-ip> 6379` via the instance manager HTTP API
+2. Wait for `INFO replication` to show `master_link_status:up`
+3. Update `status.instancesStatus[podName].MasterLinkStatus = "up"`
+
+**Replication reconvergence time**: Typically 5-15 seconds (depends on data size and network latency).
+
+## Split-Brain Prevention
+
+Redis Operator uses **two layers of defense** against split-brain scenarios.
+
+### Layer 1: Fencing-First Failover
+
+**Prevents**: A recovering former primary from continuing to accept writes during failover.
+
+**How it works**:
+
+1. Controller sets fence annotation **before** promoting a replica
+2. Instance manager stops Redis on the fenced pod
+3. Pod is removed from Service endpoints → clients can't reach it
+4. New primary is promoted
+5. Fence is cleared; former primary restarts as replica
+
+**Race condition protection**:
+
+- **Scenario**: Former primary recovers network connectivity after Step 2 (fencing) but before Step 4 (promotion)
+- **Outcome**: The former primary is already fenced → Redis is stopped → no writes are accepted
+- **Result**: No split-brain; new primary is promoted safely
+
+### Layer 2: Boot-Time Role Guard
+
+**Prevents**: A pod from self-electing as primary on startup, regardless of local data state.
+
+**How it works** (`internal/instance-manager/run/run.go:63-66`):
+
+On every cold start, before `redis-server` is launched:
+
+```go
+if os.Getenv("POD_NAME") == cluster.Status.CurrentPrimary {
+    // This pod is the designated primary
+    // Start Redis without REPLICAOF directive
+} else {
+    // This pod is NOT the designated primary
+    // Start Redis with REPLICAOF <currentPrimary-ip> 6379
+    // Discard any local data that diverges from the primary
+}
+```
+
+<Note>
+**Hard invariant**: The split-brain guard in `internal/instance-manager/run/run.go` must fire **before** `redis-server` starts. If `POD_NAME != status.currentPrimary`, always issue `REPLICAOF` first, regardless of local data.
+</Note>
+
+**Data loss trade-off**:
+
+- **Lost**: Any writes the former primary accepted after network partition (before fencing)
+- **Preserved**: All writes accepted by the new primary after promotion
+- **Philosophy**: Matches CloudNativePG's `pg_rewind` behavior — prefer consistency over preserving isolated writes
+
+### Layer 3: Runtime Primary Isolation Detection
+
+**Prevents**: An isolated primary (can't reach API server or peers) from continuing to accept writes.
+
+**How it works** (`internal/instance-manager/webserver/server.go`):
+
+The liveness probe (`GET /healthz`) on primary pods includes additional checks:
+
+1. **Kubernetes API reachability**: Can the instance manager reach the Kubernetes API server?
+2. **Peer reachability**: Can the instance manager reach other instance manager pods?
+
+**If both checks fail** (primary is isolated):
+
+- Liveness probe returns HTTP 503 (Service Unavailable)
+- Kubernetes marks the pod as unhealthy
+- After `livenessProbe.failureThreshold` consecutive failures, Kubernetes **restarts the pod**
+- On restart, the boot-time guard (Layer 2) ensures the pod starts as a replica
+
+<Info>
+This protection is configurable via `spec.primaryIsolation.enabled` (default: `true`). Disable it only in non-production environments.
+</Info>
+
+See `api/v1/rediscluster_types.go:260-275`.
+
+## Failover Timeline Example
+
+Real-world failover scenario:
+
+```
+T+0s:  Primary pod (example-0) loses network connectivity
+T+2s:  Controller status poll times out (example-0 unreachable)
+T+5s:  Second consecutive poll fails → controller initiates failover
+T+5s:  Controller sets fence annotation: redis.io/fencedInstances=["example-0"]
+T+6s:  Instance manager on example-0 stops redis-server (graceful SIGTERM)
+T+7s:  Controller selects example-1 (smallest lag: 120 bytes)
+T+7s:  Controller calls POST http://<example-1-ip>:9121/v1/promote
+T+8s:  Instance manager on example-1 executes REPLICAOF NO ONE
+T+8s:  Redis on example-1 confirms role:master
+T+9s:  Controller updates -leader Service selector to example-1
+T+9s:  Controller updates status.currentPrimary to example-1
+T+10s: Controller clears fence annotation
+T+15s: Former primary (example-0) recovers network, restarts
+T+16s: Instance manager on example-0 reads status.currentPrimary=example-1
+T+16s: Boot-time guard activates → starts with REPLICAOF example-1-ip 6379
+T+20s: Redis on example-0 completes PSYNC (partial resync)
+T+20s: Cluster fully reconverged, all replicas following example-1
+```
+
+**Total failover time**: ~10 seconds (T+5s detection + T+5s execution).
+
+## Configuration Options
+
+### Status Poll Interval
+
+Controls how frequently the controller polls instance managers for status.
+
+**Controller flag**:
+
+```bash
+--status-poll-interval=5s
+```
+
+**Trade-offs**:
+
+- **Shorter interval** (e.g., 2s): Faster failure detection, higher API server load
+- **Longer interval** (e.g., 10s): Slower failure detection, lower API server load
+
+### HTTP Timeout
+
+Controls how long the controller waits for instance manager HTTP responses.
+
+**Controller flag**:
+
+```bash
+--http-timeout=2s
+```
+
+**Trade-offs**:
+
+- **Shorter timeout** (e.g., 1s): Faster failure detection, more false positives during pod startup
+- **Longer timeout** (e.g., 5s): Slower failure detection, fewer false positives
+
+### Synchronous Replication
+
+Require a minimum number of replicas to acknowledge writes before the primary confirms success.
+
+**Spec configuration**:
+
+```yaml
+spec:
+  minSyncReplicas: 1  # Require at least 1 replica to acknowledge writes
+  maxSyncReplicas: 2  # Wait for up to 2 replicas (if available)
+```
+
+**Redis configuration applied**:
+
+```
+min-replicas-to-write 1
+min-replicas-max-lag 10
+```
+
+<Warning>
+Setting `minSyncReplicas > 0` **reduces availability**: if no replicas are reachable, the primary will reject writes.
+</Warning>
+
+See `api/v1/rediscluster_types.go:122-130`.
+
+### Primary Isolation Detection
+
+Enable runtime isolation checks in the primary's liveness probe.
+
+**Spec configuration**:
+
+```yaml
+spec:
+  primaryIsolation:
+    enabled: true
+    apiServerTimeout: 5s  # Timeout for API server reachability
+    peerTimeout: 5s       # Timeout for peer instance-manager reachability
+```
+
+**Behavior**:
+
+- If enabled and the primary can't reach the API server **and** can't reach any peer instance managers, the liveness probe fails
+- After `livenessProbe.failureThreshold` failures (default: 3), Kubernetes restarts the pod
+- On restart, the boot-time guard ensures the pod starts as a replica
+
+<Info>
+This is a **defense-in-depth** measure. Most split-brain scenarios are prevented by fencing-first failover (Layer 1) and the boot-time guard (Layer 2).
+</Info>
+
+## Manual Failover
+
+You can trigger a manual failover by scaling the primary pod to zero or deleting it.
+
+**Example**:
+
+```bash
+# Delete the current primary pod
+kubectl delete pod example-0
+
+# The controller detects the primary is gone and promotes a replica
+```
+
+**Controlled switchover** (zero downtime):
+
+1. The controller promotes a replica **before** deleting the old primary
+2. The old primary is deleted only after the new primary is confirmed healthy
+3. Clients experience zero write downtime (reads are always served by replicas)
+
+See [Upgrades](/operations/upgrades) for details on controlled switchovers during upgrades.
+
+## Sentinel Mode Failover
+
+In Sentinel mode (`spec.mode: sentinel`), **Sentinel handles failover**, not the operator.
+
+**Sentinel failover flow**:
+
+1. Sentinels monitor the primary via `PING` (default: every 1 second)
+2. When **quorum** Sentinels agree the primary is down (default: 2 of 3), they elect a new primary
+3. Sentinels run `REPLICAOF NO ONE` on the selected replica
+4. Sentinels reconfigure other replicas to follow the new primary
+5. **The operator detects the change** via Sentinel status polling
+6. The operator updates `status.currentPrimary` and the `-leader` Service selector
+
+<Note>
+Sentinel failover does **not** use fencing. Sentinel relies on quorum-based leader election to prevent split-brain.
+</Note>
+
+**Failover time**: Typically 5-15 seconds (faster than operator-managed failover because Sentinels monitor continuously).
+
+See [Cluster Modes](/concepts/cluster-modes#sentinel-mode) for Sentinel configuration.
+
+## Comparison with Other Operators
+
+See [Comparison with Other Redis Operators](/concepts/comparison) for how Redis Operator's failover approach compares to alternatives like OpsTree Redis Operator.
+
+**Key differentiators**:
+
+- **Fencing-first**: Redis Operator fences the old primary **before** promoting a new one
+- **Boot-time guard**: Ensures a restarting pod can never self-elect as primary
+- **Pod IP targeting**: Failover commands target specific pods, not load-balanced Services
+- **Controlled switchover**: Rolling updates promote a replica first, then delete the old primary (zero downtime)
+
+## Next Steps
+
+- [Architecture](/concepts/architecture) — Understand the split control/data plane
+- [Cluster Modes](/concepts/cluster-modes) — Standalone vs Sentinel failover behavior
+- [Rolling Updates](/operations/rolling-updates) — Zero-downtime primary upgrades

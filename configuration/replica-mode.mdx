@@ -1,0 +1,588 @@
+---
+title: Replica Mode (External Replication)
+description: Cross-cluster replication for disaster recovery
+---
+
+Replica mode configures a RedisCluster to act as a full-cluster replica of an external Redis primary. This enables **disaster recovery** (DR) topologies where a secondary cluster replicates all data from a primary cluster.
+
+## Overview
+
+In replica mode:
+- **All data pods** replicate from an external Redis instance
+- The cluster has a **designated leader** (local primary candidate)
+- Replication can be **promoted** to make the cluster standalone
+
+**Use case**: Multi-region DR
+
+```
+Region A (Production)          Region B (DR)
+┌─────────────────┐           ┌─────────────────┐
+│ Primary Cluster │           │ Replica Cluster │
+│ prod-redis      │           │ dr-redis        │
+│                 │           │                 │
+│ ┌─────┐         │           │ ┌─────┐         │
+│ │ P   │◄────────┼───────────┼─┤ L   │ Leader  │
+│ └─────┘         │ Replicate │ └─────┘         │
+│ ┌─────┐         │           │ ┌─────┐         │
+│ │ R   │◄────────┼───────────┼─┤ R   │         │
+│ └─────┘         │           │ └─────┘         │
+└─────────────────┘           └─────────────────┘
+
+On failover: promote=true → L becomes standalone primary
+```
+
+## Configuration
+
+<ParamField path="replicaMode.enabled" type="bool" default="false">
+  Toggles external replication mode for all data pods.
+  
+  When `true`, all pods issue `REPLICAOF <source.host> <source.port>`.
+</ParamField>
+
+<ParamField path="replicaMode.source" type="ReplicaSourceSpec">
+  Identifies the external Redis primary to replicate from.
+  
+  <Expandable title="ReplicaSourceSpec Fields">
+    <ParamField path="host" type="string" required>
+      External Redis endpoint (hostname or IP).
+    </ParamField>
+    
+    <ParamField path="port" type="int32" default="6379">
+      External Redis port.
+      
+      **Validation**: 1-65535
+    </ParamField>
+    
+    <ParamField path="clusterName" type="string">
+      Human-readable identifier for the source cluster (used in monitoring/events).
+    </ParamField>
+    
+    <ParamField path="authSecretName" type="string">
+      Secret name containing key `password` for upstream authentication.
+      
+      Must exist in the same namespace as the RedisCluster.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="replicaMode.promote" type="bool" default="false">
+  Requests promotion of the local designated leader to standalone primary.
+  
+  When set to `true`:
+  1. Leader issues `REPLICAOF NO ONE`
+  2. Other pods reconfigured to replicate from leader
+  3. Cluster becomes standalone (replica mode disabled)
+</ParamField>
+
+## Basic Example
+
+### Primary Cluster (Region A)
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: prod-redis
+  namespace: production
+spec:
+  instances: 3
+  mode: sentinel
+  storage:
+    size: 100Gi
+  authSecret:
+    name: prod-redis-auth
+```
+
+### DR Cluster (Region B)
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: dr-redis
+  namespace: production
+spec:
+  instances: 3
+  storage:
+    size: 100Gi
+  authSecret:
+    name: dr-redis-auth
+  
+  # External replication from Region A
+  replicaMode:
+    enabled: true
+    source:
+      host: prod-redis-leader.production.svc.cluster.local  # Or external IP
+      port: 6379
+      clusterName: prod-redis-us-east
+      authSecretName: prod-redis-auth  # Must exist in this namespace
+```
+
+**Notes**:
+- `authSecretName` references the **source cluster's password**
+- The secret must be copied to the DR cluster's namespace:
+  ```bash
+  kubectl get secret prod-redis-auth -n production -o yaml | \
+    sed 's/namespace: production/namespace: dr-cluster/' | \
+    kubectl apply -f -
+  ```
+
+## Designated Leader
+
+In replica mode, the operator selects a **designated leader** — the pod that will become primary on promotion.
+
+**Selection logic**:
+- Pod with ordinal 0 (e.g., `dr-redis-0`)
+- Labeled with `redis.io/role=primary` (even though it's a replica)
+- `-leader` service points to this pod
+
+**Why?**
+- Stable endpoint for client preparation
+- Predictable promotion target
+- Consistent with standalone/sentinel mode
+
+## Promotion Workflow
+
+### Trigger Promotion
+
+Set `replicaMode.promote: true`:
+
+```yaml
+spec:
+  replicaMode:
+    enabled: true
+    source:
+      host: prod-redis-leader.production.svc.cluster.local
+      port: 6379
+    promote: true  # Add this field
+```
+
+Apply:
+```bash
+kubectl apply -f dr-cluster.yaml
+```
+
+### Operator Actions
+
+1. **Break replication**: Leader issues `REPLICAOF NO ONE`
+2. **Reconfigure replicas**: Other pods issue `REPLICAOF <leader-ip> 6379`
+3. **Disable replica mode**: `status.conditions` updated to reflect standalone state
+4. **Update status**: `currentPrimary` set to leader pod name
+
+### Status Condition
+
+```yaml
+status:
+  conditions:
+    - type: ReplicaMode
+      status: "True"
+      reason: Enabled
+      message: "Cluster is replicating from prod-redis-us-east (prod-redis-leader.production.svc.cluster.local:6379)"
+```
+
+After promotion:
+```yaml
+status:
+  conditions:
+    - type: ReplicaMode
+      status: "False"
+      reason: Promoted
+      message: "Cluster promoted to standalone (former source: prod-redis-us-east)"
+```
+
+## Implementation Details
+
+From `api/v1/rediscluster_types.go:224-258`:
+
+```go
+type ReplicaModeSpec struct {
+    // Enabled toggles external replication mode for all data pods.
+    Enabled bool `json:"enabled,omitempty"`
+    
+    // Source identifies the external Redis primary to replicate from.
+    Source *ReplicaSourceSpec `json:"source,omitempty"`
+    
+    // Promote requests promotion of the local designated leader to standalone primary.
+    Promote bool `json:"promote,omitempty"`
+}
+
+type ReplicaSourceSpec struct {
+    // ClusterName is a human-readable source cluster identifier.
+    ClusterName string `json:"clusterName,omitempty"`
+    
+    // Host is the external Redis endpoint.
+    Host string `json:"host"`
+    
+    // Port is the external Redis port.
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=65535
+    // +kubebuilder:default=6379
+    Port int32 `json:"port,omitempty"`
+    
+    // AuthSecretName references a Secret with key "password" for upstream auth.
+    AuthSecretName string `json:"authSecretName,omitempty"`
+}
+```
+
+## Cross-Region Example
+
+### Setup
+
+**Region: us-east-1** (primary)
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: redis-east
+  namespace: default
+spec:
+  instances: 5
+  mode: sentinel
+  storage:
+    size: 200Gi
+  nodeSelector:
+    topology.kubernetes.io/region: us-east-1
+  authSecret:
+    name: redis-password
+```
+
+Expose via LoadBalancer:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-east-external
+spec:
+  type: LoadBalancer
+  selector:
+    redis.io/cluster: redis-east
+    redis.io/role: primary
+  ports:
+    - port: 6379
+      targetPort: 6379
+```
+
+Get external IP:
+```bash
+kubectl get svc redis-east-external -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# Output: 35.123.45.67
+```
+
+**Region: us-west-2** (DR)
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: redis-west
+  namespace: default
+spec:
+  instances: 5
+  storage:
+    size: 200Gi
+  nodeSelector:
+    topology.kubernetes.io/region: us-west-2
+  authSecret:
+    name: redis-password  # Same password as us-east
+  
+  replicaMode:
+    enabled: true
+    source:
+      host: 35.123.45.67  # External IP from us-east
+      port: 6379
+      clusterName: redis-east
+      authSecretName: redis-password
+```
+
+### Verify Replication
+
+**On DR cluster**:
+```bash
+kubectl exec redis-west-0 -- redis-cli -a "$(kubectl get secret redis-password -o jsonpath='{.data.password}' | base64 -d)" INFO replication
+
+# Output:
+# role:slave
+# master_host:35.123.45.67
+# master_port:6379
+# master_link_status:up
+# master_sync_in_progress:0
+```
+
+### Failover to DR
+
+**Scenario**: us-east-1 region is down.
+
+1. **Promote DR cluster**:
+   ```yaml
+   spec:
+     replicaMode:
+       enabled: true
+       source:
+         host: 35.123.45.67
+         port: 6379
+       promote: true  # Trigger promotion
+   ```
+
+2. **Apply**:
+   ```bash
+   kubectl apply -f redis-west.yaml
+   ```
+
+3. **Verify promotion**:
+   ```bash
+   kubectl exec redis-west-0 -- redis-cli -a "$PASSWORD" INFO replication
+   # Output:
+   # role:master
+   # connected_slaves:4
+   ```
+
+4. **Update application config** to point to DR cluster:
+   ```yaml
+   env:
+     - name: REDIS_HOST
+       value: redis-west-leader.default.svc.cluster.local  # Changed from redis-east
+   ```
+
+### Recover Primary Region
+
+When us-east-1 comes back online, reverse the replication:
+
+```yaml
+apiVersion: redis.io/v1
+kind: RedisCluster
+metadata:
+  name: redis-east
+  namespace: default
+spec:
+  instances: 5
+  storage:
+    size: 200Gi
+  authSecret:
+    name: redis-password
+  
+  # Now replicate FROM us-west (DR)
+  replicaMode:
+    enabled: true
+    source:
+      host: <redis-west-external-ip>
+      port: 6379
+      clusterName: redis-west
+      authSecretName: redis-password
+```
+
+## Monitoring
+
+### Replication Lag
+
+Check lag on DR cluster:
+
+```bash
+kubectl exec redis-west-0 -- redis-cli -a "$PASSWORD" INFO replication | grep master_repl_offset
+# master_repl_offset:123456789
+
+# On primary:
+kubectl exec redis-east-0 -- redis-cli -a "$PASSWORD" INFO replication | grep master_repl_offset
+# master_repl_offset:123456800
+
+# Lag: 123456800 - 123456789 = 11 bytes
+```
+
+### Prometheus Metrics
+
+Instance manager exports:
+- `redis_replication_lag_bytes{cluster="redis-west"}` - Replication lag in bytes
+- `redis_master_link_up{cluster="redis-west"}` - Master link status (1=up, 0=down)
+
+**Alert**:
+```yaml
+groups:
+  - name: redis.replication
+    rules:
+      - alert: RedisReplicationLagHigh
+        expr: redis_replication_lag_bytes > 10485760  # 10 MB
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis replication lag is {{ $value | humanize }}B"
+      
+      - alert: RedisReplicationDown
+        expr: redis_master_link_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis replication link is down for {{ $labels.pod }}"
+```
+
+## Best Practices
+
+### Use stable endpoints for source.host
+
+Don't use pod IPs — they change on pod restart. Use:
+- Service DNS (for same cluster): `prod-redis-leader.production.svc.cluster.local`
+- LoadBalancer IP (for cross-cluster): `35.123.45.67`
+- Ingress hostname (for cross-cluster with TLS): `redis.us-east.example.com`
+
+### Copy source auth secret to DR namespace
+
+```bash
+kubectl get secret prod-redis-auth -n production -o yaml | \
+  sed 's/namespace: production/namespace: dr/' | \
+  kubectl apply -f -
+```
+
+Or use ExternalSecret for automated sync.
+
+### Set minSyncReplicas on primary cluster
+
+```yaml
+spec:
+  instances: 5
+  minSyncReplicas: 1  # Ensure 1 local replica ACKs writes
+```
+
+This prevents data loss if primary region fails immediately after a write.
+
+### Monitor replication lag
+
+Set up alerts for lag > 10 MB or master link down.
+
+### Test failover regularly
+
+Schedule DR drills:
+1. Promote DR cluster
+2. Run smoke tests
+3. Demote back to replica mode
+
+```bash
+# Promote
+kubectl patch rediscluster redis-west --type=merge -p '{"spec":{"replicaMode":{"promote":true}}}'
+
+# Run tests
+curl https://api.example.com/health
+
+# Demote (re-enable replication)
+kubectl patch rediscluster redis-west --type=merge -p '{"spec":{"replicaMode":{"promote":false}}}'
+```
+
+### Use TLS for cross-region replication
+
+Protect data in transit:
+
+```yaml
+spec:
+  tlsSecret:
+    name: redis-tls
+  replicaMode:
+    enabled: true
+    source:
+      host: redis.us-east.example.com  # TLS-enabled endpoint
+      port: 6379
+```
+
+## Limitations
+
+### No automatic promotion
+
+Promotion is **manual** — you must set `promote: true`. The operator does not auto-detect primary failure.
+
+**Workaround**: Use external health checks and automation:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dr-health-check
+spec:
+  schedule: "*/1 * * * *"  # Every minute
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: checker
+              image: redis:7.2
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  if ! redis-cli -h prod-redis-leader.production.svc.cluster.local PING; then
+                    kubectl patch rediscluster dr-redis --type=merge -p '{"spec":{"replicaMode":{"promote":true}}}'
+                  fi
+```
+
+### No bidirectional replication
+
+Replica mode is **unidirectional**: A → B. For bidirectional (multi-primary), use external tools like Redis Enterprise Active-Active.
+
+### Promotion is one-way
+
+Once promoted, you cannot simply set `promote: false` to revert. You must:
+1. Reconfigure source cluster to replicate from DR
+2. Re-enable replica mode on DR
+
+## Troubleshooting
+
+### Replication link down
+
+**Symptom**:
+```bash
+kubectl exec redis-west-0 -- redis-cli INFO replication | grep master_link_status
+# master_link_status:down
+```
+
+**Causes**:
+1. **Network unreachable**: Check connectivity
+   ```bash
+   kubectl exec redis-west-0 -- ping -c3 35.123.45.67
+   ```
+2. **Wrong password**: Verify `authSecretName` secret exists and matches source
+   ```bash
+   kubectl get secret prod-redis-auth -o jsonpath='{.data.password}' | base64 -d
+   ```
+3. **Firewall blocking**: Check security groups/firewall rules
+
+**Fix**: Update source configuration or network rules.
+
+### High replication lag
+
+**Symptom**: Lag > 100 MB
+
+**Causes**:
+1. **Slow network**: Cross-region bandwidth limits
+2. **High write rate**: Primary writes faster than replication can keep up
+3. **Disk bottleneck**: DR cluster storage slower than primary
+
+**Debug**:
+```bash
+# Check network throughput
+kubectl exec redis-west-0 -- redis-cli INFO replication | grep -E "(master_repl_offset|slave_repl_offset)"
+
+# Measure over time
+watch -n1 'kubectl exec redis-west-0 -- redis-cli INFO replication | grep master_repl_offset'
+```
+
+**Fix**:
+- Increase network bandwidth (cross-region VPN/peering)
+- Scale up DR cluster storage IOPS
+- Reduce write rate on primary
+
+### Promotion not working
+
+**Symptom**: `promote: true` set but pods still replicate from source.
+
+**Debug**:
+```bash
+kubectl describe rediscluster redis-west
+# Check events for errors
+
+kubectl logs -l app.kubernetes.io/name=redis-operator
+# Look for promotion errors
+```
+
+**Cause**: Operator may be unable to connect to leader pod.
+
+**Fix**: Verify leader pod is running:
+```bash
+kubectl get pods -l redis.io/cluster=redis-west,redis.io/role=primary
+```
