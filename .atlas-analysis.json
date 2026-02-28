@@ -1,0 +1,113 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Redis Operator",
+  "projectDescription": "A Kubernetes operator for managing Redis clusters with CloudNativePG-inspired architecture",
+  "theme": "aspen",
+  "primaryColor": "#DC382D",
+  "lightColor": "#FF6B6B",
+  "darkColor": "#A41E11",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/design-principles",
+              "concepts/cluster-modes",
+              "concepts/failover-and-fencing",
+              "concepts/comparison"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/cluster-spec",
+              "configuration/storage",
+              "configuration/secrets",
+              "configuration/scheduling",
+              "configuration/sentinel-mode",
+              "configuration/replica-mode"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/monitoring",
+              "operations/backups",
+              "operations/upgrades",
+              "operations/maintenance",
+              "operations/scaling",
+              "operations/performance"
+            ]
+          },
+          {
+            "group": "Runbooks",
+            "pages": [
+              "runbooks/overview",
+              "runbooks/manual-failover",
+              "runbooks/split-brain-recovery",
+              "runbooks/pvc-corruption",
+              "runbooks/total-cluster-loss",
+              "runbooks/secret-rotation",
+              "runbooks/stuck-reconciler",
+              "runbooks/operator-upgrade"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Custom Resources",
+            "pages": [
+              "api/rediscluster",
+              "api/redisbackup",
+              "api/redisscheduledbackup"
+            ]
+          },
+          {
+            "group": "Instance Manager",
+            "pages": [
+              "api/instance-http-api",
+              "api/instance-reconciler"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Direct Pod/PVC management without StatefulSets for precise lifecycle control",
+    "CloudNativePG-inspired split control/data architecture with deterministic failover",
+    "Fencing-first failover with boot-time split-brain guard",
+    "Standalone and Sentinel modes with native Redis replication",
+    "Backup and scheduled backup workflows to S3-compatible storage",
+    "In-pod instance manager with HTTP API for operator communication",
+    "Live secret rotation without pod restarts",
+    "Rolling updates with replicas-first, primary-last strategy"
+  ],
+  "publicApiSurface": [
+    "RedisCluster CRD (redis.io/v1) - Main cluster lifecycle management",
+    "RedisBackup CRD (redis.io/v1) - One-off backup execution",
+    "RedisScheduledBackup CRD (redis.io/v1) - Cron-based backup scheduling",
+    "Services: <name>-leader, <name>-replica, <name>-any, <name>-sentinel",
+    "Instance Manager HTTP API: GET /v1/status, POST /v1/promote, POST /v1/backup",
+    "Helm chart: charts/redis-operator",
+    "ClusterMode: standalone, sentinel (cluster reserved/unimplemented)",
+    "PrimaryUpdateStrategy: unsupervised, supervised",
+    "BackupMethod: rdb, aof",
+    "BackupTarget: primary, prefer-replica"
+  ]
+}
